@@ -1,0 +1,40 @@
+{
+  "name": "PDF RAG Pipeline",
+  "description": "Ingest PDFs from UC volume, parse to Delta, chunk, and create Vector Search index. Update notebook paths and cluster spec for your workspace.",
+  "job_clusters": [
+    {
+      "job_cluster_key": "pdf_rag_cluster",
+      "new_cluster": {
+        "spark_version": "14.3.x-scala2.12",
+        "node_type_id": "i3.xlarge",
+        "num_workers": 0,
+        "data_security_mode": "USER_ISOLATION",
+        "runtime_engine": "PHOTON"
+      }
+    }
+  ],
+  "tasks": [
+    {
+      "task_key": "ingest_parse",
+      "description": "Read PDFs from volume, parse with PyMuPDF, write to Delta parsed table",
+      "notebook_task": {
+        "notebook_path": "/Repos/<your-repo-folder>/pdf-ocr-rag-accelerator/notebooks/01-ingest-parse-pdfs",
+        "source": "WORKSPACE"
+      },
+      "job_cluster_key": "pdf_rag_cluster"
+    },
+    {
+      "task_key": "chunk_index",
+      "description": "Chunk parsed table, write chunked Delta table, create/update Vector Search index",
+      "depends_on": [
+        { "task_key": "ingest_parse" }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Repos/<your-repo-folder>/pdf-ocr-rag-accelerator/notebooks/02-chunk-index",
+        "source": "WORKSPACE"
+      },
+      "job_cluster_key": "pdf_rag_cluster"
+    }
+  ],
+  "format": "MULTI_TASK"
+}

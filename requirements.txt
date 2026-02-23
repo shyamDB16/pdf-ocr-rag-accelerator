@@ -1,0 +1,18 @@
+# PDF RAG Solution Accelerator – dependencies for ingest, parse, chunk, index
+# Use in a Databricks notebook job or with Spark Connect when running externally.
+
+# PDF parsing (notebook 01)
+PyMuPDF>=1.23.0
+pymupdf4llm>=0.0.0
+
+# Chunking (notebook 02)
+langchain-text-splitters>=0.2.0
+
+# Databricks (Vector Search API, optional Spark Connect)
+databricks-sdk>=0.20.0
+
+# Optional: config loading for scripts
+pyyaml>=6.0
+
+# Spark Connect (only if running driver externally against Databricks cluster)
+# databricks-connect>=14.0.0

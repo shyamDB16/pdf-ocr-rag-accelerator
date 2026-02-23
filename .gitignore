@@ -1,0 +1,18 @@
+# Config with secrets or env-specific values
+config/config.yml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Databricks
+.databricks/
