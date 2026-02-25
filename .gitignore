@@ -4,15 +4,41 @@ config/config.yml
 # Python
 __pycache__/
 *.py[cod]
+*.pyo
 .venv/
 venv/
 .env
+.env.local
 *.egg-info/
+dist/
+build/
 
 # IDE
 .idea/
 .vscode/
 *.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backup / temp
+*.bak
+*.orig
+*.save
 
 # Databricks
 .databricks/
+
+# AI Dev Kit (install script creates this; remove from gitignore to commit version)
+.ai-dev-kit/
+
+# AI Dev Kit skills (recreated by install; ignore to keep repo small)
+.cursor/skills/
+.claude/skills/
+
+# MCP config (machine-specific paths and profile; install script creates these)
+.mcp.json
+.cursor/mcp.json

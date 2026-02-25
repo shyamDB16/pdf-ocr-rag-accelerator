@@ -1,100 +1,48 @@
 #!/usr/bin/env python3
 """
-PDF RAG pipeline entrypoint for external or job-based runs.
+Chunk + index step for the PDF OCR RAG pipeline.
 
-Loads config from config/config.yml (or env) and runs:
-  1. Ingest & parse PDFs -> Delta parsed_table
-  2. Chunk -> Delta chunked_table, then create/update Vector Search index
+The full pipeline is:
+  1. OCR + adapter (Ray, vLLM, GPU) → notebook 01-ocr-and-adapter.py or Databricks Job
+  2. Chunk + Vector Search index → this script or notebook 02-chunk-index.py
 
-Requires a Spark session (e.g. Databricks notebook, or Spark Connect to a
-Databricks cluster). For Databricks, prefer running the notebooks directly
-or as workflow tasks; use this script when driving from CI or a local driver
-with Spark Connect.
+This script runs only step 2. It reads the parsed-docs table produced by 01
+(content, parser_status, doc_uri, last_modified), chunks with RecursiveCharacterTextSplitter,
+writes the chunked Delta table, enables CDC, and creates/updates the Vector Search index.
+
+Requires a Spark session (Databricks notebook or Spark Connect) and config (parsed_table,
+chunked_table, vector index, endpoints). Run step 1 via the GPU notebook/Job first.
 
 Usage:
-  # From repo root, with config/config.yml present:
-  python scripts/run_pipeline.py [--ingest-only | --chunk-only]
+  python scripts/run_pipeline.py [--config path/to/config.yml]
 """
 from __future__ import annotations
 
 import argparse
-import os
 import sys
+import time
 from pathlib import Path
 
 # Repo root = parent of scripts/
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-def load_config():
-    """Load config from config/config.yml if present."""
-    config_path = REPO_ROOT / "config" / "config.yml"
-    if not config_path.exists():
-        return None
+def load_config(config_path: Path | None = None) -> dict:
+    """Load config from config/config.yml or given path."""
+    path = config_path or REPO_ROOT / "config" / "config.yml"
+    if not path.exists():
+        return {}
     try:
         import yaml
-        with open(config_path) as f:
-            return yaml.safe_load(f)
+        with open(path) as f:
+            return yaml.safe_load(f) or {}
     except Exception as e:
-        print(f"Warning: could not load {config_path}: {e}", file=sys.stderr)
-    return None
-
-
-def run_ingest_parse(spark, config: dict) -> None:
-    """Run ingest + parse step (notebook 01 logic)."""
-    catalog = config.get("catalog", "main")
-    schema = config.get("schema", "default")
-    volume_name = config.get("volume_name", "pdf_docs")
-    parsed_table = config.get("parsed_table") or f"{catalog}.{schema}.rag_parsed_docs"
-    volume_path = f"/Volumes/{catalog}/{schema}/{volume_name}"
-
-    import fitz
-    import pymupdf4llm
-    from urllib.parse import urlparse
-    from pyspark.sql.types import StructType, StructField, StringType, TimestampType
-    import pyspark.sql.functions as F
-
-    def parse_pdf(content: bytes, path: str, modification_time, doc_length: int) -> tuple:
-        try:
-            doc = fitz.Document(stream=content, filetype="pdf")
-            md_text = pymupdf4llm.to_markdown(doc)
-            doc_uri = urlparse(path).path or path
-            return (md_text.strip(), "SUCCESS", doc_uri, modification_time)
-        except Exception as e:
-            return ("", f"ERROR: {e}", path, modification_time)
-
-    schema_out = StructType([
-        StructField("content", StringType()),
-        StructField("parser_status", StringType()),
-        StructField("doc_uri", StringType()),
-        StructField("last_modified", TimestampType()),
-    ])
-    parse_udf = F.udf(parse_pdf, schema_out)
-
-    raw_df = (
-        spark.read.format("binaryFile")
-        .option("recursiveFileLookup", "true")
-        .load(volume_path)
-    )
-    raw_df = raw_df.filter(F.col("path").rlike(r"\.pdf$"))
-    if raw_df.count() == 0:
-        raise ValueError(f"No PDF files found under {volume_path}")
-
-    parsed_df = raw_df.withColumn(
-        "parsed",
-        parse_udf("content", "path", "modificationTime", "length")
-    ).select(
-        F.col("parsed.content").alias("content"),
-        F.col("parsed.parser_status").alias("parser_status"),
-        F.col("parsed.doc_uri").alias("doc_uri"),
-        F.col("parsed.last_modified").alias("last_modified"),
-    )
-    parsed_df.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(parsed_table)
-    print(f"Wrote {parsed_df.count()} rows to {parsed_table}")
+        print(f"Warning: could not load {path}: {e}", file=sys.stderr)
+    return {}
 
 
 def run_chunk_index(spark, config: dict) -> None:
-    """Run chunk + Vector Search index step (notebook 02 logic)."""
+    """Run chunk + Vector Search index (same logic as 02-chunk-index.py)."""
     parsed_table = config.get("parsed_table", "main.default.rag_parsed_docs")
     chunked_table = config.get("chunked_table", "main.default.rag_docs_chunked")
     vector_index_name = config.get("vector_index_name", "main.default.rag_docs_chunked_index")
@@ -138,7 +86,6 @@ def run_chunk_index(spark, config: dict) -> None:
     )
     from databricks.sdk import WorkspaceClient
     from databricks.sdk.errors.platform import ResourceDoesNotExist, BadRequest
-    import time
 
     w = WorkspaceClient()
     vsc = w.vector_search_indexes
@@ -183,39 +130,27 @@ def run_chunk_index(spark, config: dict) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run PDF RAG pipeline (ingest+parse, chunk+index)")
-    parser.add_argument("--ingest-only", action="store_true", help="Only run ingest & parse")
-    parser.add_argument("--chunk-only", action="store_true", help="Only run chunk & index")
+    parser = argparse.ArgumentParser(
+        description="Run chunk + index step (parsed-docs → chunked table + Vector Search). OCR step: use 01-ocr-and-adapter.py or Job."
+    )
     parser.add_argument("--config", type=Path, default=None, help="Path to config.yml")
     args = parser.parse_args()
 
-    config_path = args.config or (REPO_ROOT / "config" / "config.yml")
-    if config_path.exists():
-        import yaml
-        with open(config_path) as f:
-            config = yaml.safe_load(f) or {}
-    else:
-        config = load_config() or {}
-        if not config:
-            print("No config found; using defaults. Copy config/config.yml.example to config/config.yml.", file=sys.stderr)
+    config = load_config(args.config)
+    if not config:
+        print("No config found; using defaults. Copy config/config.yml.example to config/config.yml.", file=sys.stderr)
 
     try:
-        spark = __get_spark()
+        spark = _get_spark()
     except NameError:
-        print("No Spark session found. Run this script from a Databricks notebook or with Spark Connect.", file=sys.stderr)
+        print("No Spark session found. Run from a Databricks notebook or with Spark Connect.", file=sys.stderr)
         sys.exit(1)
 
-    if args.chunk_only:
-        run_chunk_index(spark, config)
-    elif args.ingest_only:
-        run_ingest_parse(spark, config)
-    else:
-        run_ingest_parse(spark, config)
-        run_chunk_index(spark, config)
+    run_chunk_index(spark, config)
     print("Done.")
 
 
-def __get_spark():
+def _get_spark():
     """Get Spark session (Databricks notebook or Spark Connect)."""
     try:
         from pyspark.sql import SparkSession

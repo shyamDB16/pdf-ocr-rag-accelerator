@@ -1,9 +1,18 @@
 {
-  "name": "PDF RAG Pipeline",
-  "description": "Ingest PDFs from UC volume, parse to Delta, chunk, and create Vector Search index. Update notebook paths and cluster spec for your workspace.",
+  "name": "PDF OCR RAG Pipeline",
+  "description": "OCR images (HunyuanOCR/DeepSeek-OCR), adapter to parsed-docs table, chunk, and create Vector Search index. Task 1 requires GPU cluster. Update notebook paths for your repo.",
   "job_clusters": [
     {
-      "job_cluster_key": "pdf_rag_cluster",
+      "job_cluster_key": "gpu_cluster",
+      "new_cluster": {
+        "spark_version": "14.3.x-gpu-ml-scala2.12",
+        "node_type_id": "g5.xlarge",
+        "num_workers": 1,
+        "data_security_mode": "USER_ISOLATION"
+      }
+    },
+    {
+      "job_cluster_key": "cpu_cluster",
       "new_cluster": {
         "spark_version": "14.3.x-scala2.12",
         "node_type_id": "i3.xlarge",
@@ -15,25 +24,23 @@
   ],
   "tasks": [
     {
-      "task_key": "ingest_parse",
-      "description": "Read PDFs from volume, parse with PyMuPDF, write to Delta parsed table",
+      "task_key": "ocr_and_adapter",
+      "description": "Run OCR on images (Ray+vLLM), write OCR Delta table, adapter to parsed-docs table",
       "notebook_task": {
-        "notebook_path": "/Repos/<your-repo-folder>/pdf-ocr-rag-accelerator/notebooks/01-ingest-parse-pdfs",
+        "notebook_path": "/Repos/<your-repo-folder>/pdf-ocr-rag-accelerator/notebooks/01-ocr-and-adapter",
         "source": "WORKSPACE"
       },
-      "job_cluster_key": "pdf_rag_cluster"
+      "job_cluster_key": "gpu_cluster"
     },
     {
       "task_key": "chunk_index",
-      "description": "Chunk parsed table, write chunked Delta table, create/update Vector Search index",
-      "depends_on": [
-        { "task_key": "ingest_parse" }
-      ],
+      "description": "Chunk parsed-docs table from 01, write chunked Delta table, create/update Vector Search index",
+      "depends_on": [{"task_key": "ocr_and_adapter"}],
       "notebook_task": {
         "notebook_path": "/Repos/<your-repo-folder>/pdf-ocr-rag-accelerator/notebooks/02-chunk-index",
         "source": "WORKSPACE"
       },
-      "job_cluster_key": "pdf_rag_cluster"
+      "job_cluster_key": "cpu_cluster"
     }
   ],
   "format": "MULTI_TASK"

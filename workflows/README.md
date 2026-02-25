@@ -1,31 +1,33 @@
-# PDF RAG Job
+# PDF OCR RAG Job
 
-Run the full pipeline (ingest → parse → chunk → index) as a single Databricks Job.
+Run the full pipeline (OCR + adapter → chunk → index) as a single Databricks Job.
+
+## Pipeline
+
+1. **ocr_and_adapter** (`01-ocr-and-adapter.py`): Runs on a **GPU cluster**. OCRs images (HunyuanOCR or DeepSeek-OCR via Ray + vLLM), writes OCR results to Delta, then **adapts** to the parsed-docs shape (one row per document: `content`, `parser_status`, `doc_uri`, `last_modified`).
+2. **chunk_index** (`02-chunk-index.py`): Runs on a **CPU cluster**. Reads the parsed-docs table, chunks with LangChain, writes chunked Delta table, enables CDC, creates/updates the Vector Search index.
 
 ## Option 1: Import job definition
 
 1. **Edit paths** in `pdf_rag_job.json`:
-   - Replace `<your-repo-folder>` with your Repos folder path (e.g. `shyam@company.com/pdf-ocr-rag-accelerator` or the folder name where you cloned the repo).
-   - Notebook paths must be the full workspace paths to the notebooks under your repo, e.g.:
-     - `/Repos/<your-repo-folder>/pdf-ocr-rag-accelerator/notebooks/01-ingest-parse-pdfs`
-     - `/Repos/<your-repo-folder>/pdf-ocr-rag-accelerator/notebooks/02-chunk-index`
+   - Replace `<your-repo-folder>` with your Repos folder path (e.g. `shyam@company.com/pdf-ocr-rag-accelerator`).
+   - Notebook paths:
+     - `.../pdf-ocr-rag-accelerator/notebooks/01-ocr-and-adapter`
+     - `.../pdf-ocr-rag-accelerator/notebooks/02-chunk-index`
 
-2. **Optional**: Adjust `job_clusters` (e.g. `spark_version`, `node_type_id`, `num_workers`) for your workspace.
+2. **Optional**: Adjust job clusters (e.g. `gpu_cluster`: node type, workers; `cpu_cluster`: node type). Task 1 must use a GPU cluster for OCR.
 
-3. **Create the job**:
-   - **UI**: Workflows → Jobs → Create job → **Switch to JSON** (or Import JSON), paste the contents of `pdf_rag_job.json`, then Save.
-   - **CLI**: `databricks jobs create --json-file workflows/pdf_rag_job.json`
+3. **Create the job**: Workflows → Jobs → Create job → JSON, paste the contents of `pdf_rag_job.json`, then Save.
 
-4. **Config**: Set catalog, schema, volume, and table names in the **Config** cell of each notebook (01 and 02) before running the job, or use job parameters and pass them into the notebooks if you add parameter support.
+4. **Config**: Set widget values in 01 (image_dir, uc_catalog, uc_schema, parsed_table, etc.) and 02 (catalog, schema, parsed_table_suffix, endpoints) before running, or use job parameters if you wire them.
 
-## Option 2: Create job from UI (no JSON)
+## Option 2: Create job from UI
 
-1. Workflows → Jobs → Create job.
-2. Add **Task 1**: Notebook task → select `pdf-ocr-rag-accelerator/notebooks/01-ingest-parse-pdfs.ipynb` from your Repo.
-3. Add **Task 2**: Notebook task → select `pdf-ocr-rag-accelerator/notebooks/02-chunk-index.ipynb`; set **Depends on** → Task 1.
-4. Create a **Job cluster** (e.g. single-node Photon, `i3.xlarge`) and assign it to both tasks.
-5. Save and run.
+1. Create job with two tasks.
+2. **Task 1**: Notebook `01-ocr-and-adapter.py`, **GPU cluster** (e.g. g5.xlarge, 1 worker).
+3. **Task 2**: Notebook `02-chunk-index.py`, **CPU cluster**; Depends on Task 1.
+4. Save and run.
 
 ## Schedule (optional)
 
-In the job settings, add a **Schedule** (e.g. daily or weekly) to refresh the parsed/chunked tables and Vector Search index from new PDFs in the volume.
+Add a schedule to refresh the pipeline when new images (or PDFs converted to images) are added to the volume.

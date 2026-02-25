@@ -1,18 +1,15 @@
-# PDF RAG Solution Accelerator – dependencies for ingest, parse, chunk, index
-# Use in a Databricks notebook job or with Spark Connect when running externally.
+# PDF OCR RAG Accelerator – dependencies
+# Notebook 01 (OCR) is run on a GPU cluster with torch, vllm, ray, etc. (see 01-ocr-and-adapter.py install cell).
+# Notebook 02 and scripts use the below.
 
-# PDF parsing (notebook 01)
-PyMuPDF>=1.23.0
-pymupdf4llm>=0.0.0
-
-# Chunking (notebook 02)
+# Chunking (02-chunk-index)
 langchain-text-splitters>=0.2.0
 
-# Databricks (Vector Search API, optional Spark Connect)
+# Databricks (Vector Search API)
 databricks-sdk>=0.20.0
 
-# Optional: config loading for scripts
-pyyaml>=6.0
+# PDF→image helper (e.g. in 01-ocr-and-adapter or prep scripts)
+PyMuPDF>=1.23.0
 
-# Spark Connect (only if running driver externally against Databricks cluster)
-# databricks-connect>=14.0.0
+# Config loading for scripts
+pyyaml>=6.0

@@ -1,15 +1,15 @@
 # PDF OCR RAG Accelerator
 
-Plug-and-play pipeline for **ingesting many PDFs**, **parsing** (and optionally **OCR**), and building a **retrieval-ready** Delta table + Vector Search index. Works in **Databricks** and **externally** (e.g. Spark Connect, local Python).
+Plug-and-play pipeline: **OCR document images** (HunyuanOCR or DeepSeek-OCR on a GPU cluster), **adapter** to parsed-docs shape, then **chunk and build a Vector Search index** for RAG. Works in **Databricks** (notebooks run as `.py` in Repos).
 
 ## What it does
 
-| Step | Notebook / Script | Output |
-|------|-------------------|--------|
-| **1. Ingest & parse** | `01-ingest-parse-pdfs.ipynb` | Delta table: `content`, `parser_status`, `doc_uri`, `last_modified` |
-| **2. Chunk & index** | `02-chunk-index.ipynb` | Chunked Delta table + Vector Search index (Delta Sync) |
+| Step | Notebook | Output |
+|------|----------|--------|
+| **1. OCR + adapter** | `01-ocr-and-adapter.py` | OCR Delta table (one row per page) → **parsed-docs** Delta table (one row per document: `content`, `parser_status`, `doc_uri`, `last_modified`) |
+| **2. Chunk & index** | `02-chunk-index.py` | Chunked Delta table + Vector Search index (Delta Sync) |
 
-- **Parsing**: Native PDF text extraction (PyMuPDF + `pymupdf4llm` → markdown). For scanned PDFs, use the OCR notebooks in the parent repo (`sgc-vllm-ocr.ipynb` or `classic-cluster-ocr-hunyuanocr.ipynb`) to produce images/text first, then point this pipeline at the resulting content.
+- **OCR**: Distributed OCR on a **classic GPU cluster** (Ray + vLLM), HunyuanOCR or DeepSeek-OCR. Input: PNG images in a UC volume directory (e.g. from PDF→image conversion). Output: one row per page; then an **adapter** aggregates by document and writes the parsed-docs table expected by 02.
 - **Chunking**: Character-based (LangChain `RecursiveCharacterTextSplitter`).
 - **Index**: Databricks Vector Search with Delta Sync; embeddings from the configured embedding endpoint.
 
@@ -17,70 +17,86 @@ Plug-and-play pipeline for **ingesting many PDFs**, **parsing** (and optionally 
 
 ```
 pdf-ocr-rag-accelerator/
-├── README.md                 # This file
+├── README.md
+├── databricks.yml              # Databricks Asset Bundle root config
+├── resources/
+│   └── pdf_ocr_rag_job.yml     # DAB job: ocr_and_adapter (GPU) → chunk_index (CPU)
 ├── config/
-│   └── config.yml.example    # Copy to config.yml and edit
+│   └── config.yml.example
 ├── notebooks/
-│   ├── 01-ingest-parse-pdfs.ipynb
-│   └── 02-chunk-index.ipynb
-├── workflows/                # Databricks Job (ingest → chunk/index)
-│   ├── pdf_rag_job.json      # Job definition: 2 tasks, 1 cluster
-│   └── README.md             # How to import or create the job
-├── scripts/                  # Optional: run outside Databricks
-│   └── run_pipeline.py
+│   ├── 01-ocr-and-adapter.py   # OCR (Ray+vLLM) + adapter → parsed-docs table
+│   └── 02-chunk-index.py       # Chunk + Vector Search index
+├── workflows/
+│   ├── pdf_rag_job.json        # Job JSON (manual import alternative)
+│   └── README.md
+├── docs/
+│   └── USING_AI_DEV_KIT_FOR_DAB.md   # How to use AI Dev Kit to build this DAB
+├── scripts/
+│   └── run_pipeline.py         # Chunk + index only (after 01 has produced parsed-docs)
 └── requirements.txt
 ```
 
 ## Use in Databricks
 
-1. **Clone or import** this repo into your workspace (Repo or folder).
-2. **Config**: In each notebook, set the **Config** cell to your catalog, schema, volume, table names, and Vector Search endpoint/embedding model (or load from `config/config.yml` if you add a loader cell).
-3. **Run order**:
-   - Run **01-ingest-parse-pdfs.ipynb** (ensure volume exists; optionally downloads sample PDFs; parses and writes to `parsed_table`).
-   - Run **02-chunk-index.ipynb** (reads `parsed_table`, chunks, writes `chunked_table`, enables CDC, creates Vector Search index).
-4. **Job (recommended)**: Use the predefined job so the pipeline runs in one go:
-   - **Import**: Edit `workflows/pdf_rag_job.json` (set your repo path to `.../pdf-ocr-rag-accelerator/notebooks/...` and optional cluster spec), then create the job via **Workflows → Create job → JSON** or `databricks jobs create --json-file workflows/pdf_rag_job.json`.
-   - **Or create manually**: Workflows → Create job → add two notebook tasks (01 then 02, task 2 depends on task 1), attach a job cluster. See **workflows/README.md** for step-by-step.
-   - Configure catalog, schema, volume, and tables in each notebook’s Config cell (or add job parameters and wire them into the notebooks).
+1. **Clone or import** this repo into your workspace (Repos).
+2. **Input**: Put **PNG images** in a Unity Catalog volume directory (e.g. `/Volumes/<catalog>/<schema>/<volume>/images/`). For PDFs, use the PDF→image helper in 01 (e.g. `pdf_to_images_pymupdf`) in a separate run or script, then point `image_dir` at that directory.
+3. **Config**: In **01-ocr-and-adapter.py**, set widgets: `image_dir`, `ocr_model` (HunyuanOCR or DeepSeek-OCR), `uc_catalog`, `uc_schema`, `uc_volume`, `uc_table` (OCR results), `parsed_table` (adapter output). In **02-chunk-index.py**, set `catalog`, `schema`, `parsed_table_suffix` to match 01’s parsed table, plus Vector Search endpoint and embedding endpoint.
+4. **Run order**: Run **01-ocr-and-adapter.py** on a **GPU cluster** (Ray + vLLM). Then run **02-chunk-index.py** on a CPU cluster (or same cluster).
+5. **Job**: Use the DAB (see below) or `workflows/pdf_rag_job.json` for manual import. See **workflows/README.md**.
 
-**OCR path (scanned PDFs):**  
-Use the OCR notebooks in the parent folder to turn PDFs into text/images, write OCR text into a Delta table or volume, then either (a) point notebook 01 at that output (if it’s already “parsed” rows) or (b) add a small adapter notebook that reads OCR output and writes the same schema as 01 (`content`, `parser_status`, `doc_uri`, `last_modified`) so 02 can run unchanged.
+## Deploy with Databricks Asset Bundles (DABs)
 
-## Use externally (e.g. Spark Connect, local)
+Deploy and run the pipeline as a single job using the Databricks CLI:
 
-1. **Config**: Copy `config/config.yml.example` to `config/config.yml` and set your values. For external runs you may set a local path for PDFs and use Spark Connect to run against a Databricks cluster.
-2. **Dependencies**: `pip install -r requirements.txt`
-3. **Run**:
-   - **Option A**: Use **Databricks Repos** or **Sync** so the notebooks live in the workspace and run them via Databricks Jobs (no change from “Use in Databricks”).
-   - **Option B**: Use `scripts/run_pipeline.py` with Spark Connect: connect to the cluster, run the same logic (read PDFs from volume or local path, parse, write to Delta; chunk; create index) so the pipeline is driven from your machine or CI.
+1. **Prerequisites**: [Databricks CLI](https://docs.databricks.com/dev-tools/cli/) installed and configured (`databricks configure --profile DEFAULT`).
+2. **Edit** `databricks.yml`: set `workspace.profile` (or `workspace.host`) for each target (`dev` / `prod`) to match your workspace.
+3. **Validate**: `databricks bundle validate -t dev`
+4. **Deploy** (uploads notebooks and creates/updates the job): `databricks bundle deploy -t dev`
+5. **Run**: `databricks bundle run pdf_ocr_rag_pipeline -t dev`
+
+**Using the AI Dev Kit to build or change the DAB:** See [docs/USING_AI_DEV_KIT_FOR_DAB.md](docs/USING_AI_DEV_KIT_FOR_DAB.md) for step-by-step instructions (install the kit from this repo, open in Cursor, ask the AI to create or modify the bundle).
+
+### How the DAB works (plug and play)
+
+| Step | What happens |
+|------|-------------------------------|
+| **Deploy** | The bundle uploads `notebooks/01-ocr-and-adapter.py` and `02-chunk-index.py` to your workspace and creates or updates the job **PDF OCR RAG Pipeline**. Task parameters (catalog, schema, image_dir, parsed table, Vector Search/embedding endpoints) are taken from **bundle variables** in `databricks.yml`. |
+| **Configure once** | Set variables in `databricks.yml` (globally or per target). The ones that usually need changing: **`image_dir`** (where your PNGs live), **`catalog`** and **`schema`** if not `main`/`default`, and **`vector_search_endpoint`** / **`embedding_endpoint`** if your workspace uses different names. |
+| **Run** | `databricks bundle run pdf_ocr_rag_pipeline -t dev` starts the job. No need to fill in widget values in the UI; the job passes them from the bundle. |
+
+So **plug and play** means: clone the repo → set `image_dir` (and optionally catalog/schema/endpoints) in `databricks.yml` → `bundle deploy` → `bundle run`. Ensure PNGs are in `image_dir` and that the Vector Search and embedding endpoints exist in the workspace. To add a schedule, add a `schedule:` block under the job in `resources/pdf_ocr_rag_job.yml`.
+
+## Adapter (01 → 02)
+
+The OCR table has **one row per page** (`image_path`, `ocr_text`, `model`, `timestamp`). The **adapter** in 01 derives `doc_uri` from `image_path` (e.g. `mydoc_page_1.png` → base name), concatenates `ocr_text` in page order, and writes a table with one row per document: `content`, `parser_status`, `doc_uri`, `last_modified`. That table is the input to 02.
 
 ## Config reference
 
 | Key | Description |
 |-----|-------------|
+| `image_dir` | Directory of PNG images (e.g. `/Volumes/<catalog>/<schema>/<volume>/images`) |
+| `ocr_model` | `tencent/HunyuanOCR` or `deepseek-ai/DeepSeek-OCR` |
 | `catalog`, `schema` | Unity Catalog catalog and schema |
-| `volume_name` | UC volume name for source PDFs (path = `/Volumes/{catalog}/{schema}/{volume_name}`) |
-| `parsed_table` | Full table name for parsed docs (output of notebook 01) |
-| `chunked_table` | Full table name for chunked docs (output of notebook 02) |
-| `vector_index_name` | Vector Search index name |
-| `vector_search_endpoint` | Databricks Vector Search endpoint name |
-| `embedding_endpoint` | Databricks embedding model endpoint name |
+| `parsed_table` | Full table name for adapter output (input to 02) |
+| `chunked_table`, `vector_index_name` | Chunked table and Vector Search index |
+| `vector_search_endpoint`, `embedding_endpoint` | Databricks Vector Search and embedding endpoints |
 | `chunk_size`, `chunk_overlap` | Chunking parameters |
 
 ## Requirements
 
-- **Databricks**: Unity Catalog enabled; Vector Search endpoint and embedding endpoint created; cluster with access to the volume and tables.
-- **Notebook 01**: `pymupdf4llm`, `PyMuPDF` (fitz).
-- **Notebook 02**: `langchain-text-splitters`; Databricks SDK for Vector Search API.
+- **01**: Classic Databricks **GPU cluster** (e.g. g5.xlarge), Ray, vLLM, PyMuPDF, transformers. Hugging Face token if using gated models.
+- **02**: CPU cluster; `langchain-text-splitters`, Databricks SDK. Vector Search and embedding endpoints must exist in the workspace.
+
+## Scripts
+
+`scripts/run_pipeline.py` runs only the **chunk + index** step (reads parsed-docs from 01, chunks, writes chunked table, creates/updates Vector Search index). Run **01-ocr-and-adapter.py** (Ray, vLLM, GPU) first to produce the parsed-docs table.
 
 ## Pushing to your Git
 
-Use this folder as a **standalone repo** (e.g. named `pdf-ocr-rag-accelerator` on GitHub/GitLab):
+Use this folder as a standalone repo (e.g. `pdf-ocr-rag-accelerator` on GitHub):
 
-1. **Create a new repo** on your Git host (GitHub, GitLab, etc.) named `pdf-ocr-rag-accelerator` (or "PDF OCR RAG Accelerator"). Do not initialize with a README if you already have one here.
-
-2. **From this folder** (`pdf-ocr-rag-accelerator`):
-
+1. Create a new repo on your Git host. Do not add a README if you already have one here.
+2. From this folder:
    ```bash
    cd pdf-ocr-rag-accelerator
    git init
@@ -91,10 +107,6 @@ Use this folder as a **standalone repo** (e.g. named `pdf-ocr-rag-accelerator` o
    git push -u origin main
    ```
 
-   Replace `<your-org>/pdf-ocr-rag-accelerator` with your actual repo URL (SSH or HTTPS).
-
-3. **If the accelerator lives inside another repo** (e.g. `oss-ocr`) and you want it as its own repo: copy this folder to a new directory, `cd` into it, then run the commands above (no need to `git init` again if you copied without `.git`).
-
 ## License and attribution
 
-See repo root. For sample PDFs, the default uses [dbdemos-dataset](https://github.com/databricks-demos/dbdemos-dataset) (Databricks demos).
+See repo root. OCR models: HunyuanOCR (Tencent), DeepSeek-OCR (DeepSeek). See their Hugging Face model cards for terms.

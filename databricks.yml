@@ -1,0 +1,52 @@
+# Databricks Asset Bundle – PDF OCR RAG Accelerator
+# See https://docs.databricks.com/dev-tools/bundles/
+
+bundle:
+  name: pdf-ocr-rag-accelerator
+
+include:
+  - resources/*.yml
+
+variables:
+  catalog:
+    default: main
+  schema:
+    default: default
+  # Where PNG images live (e.g. output of PDF→image). Set per target if needed.
+  image_dir:
+    default: /Volumes/main/default/ocr_data/images
+  # Parsed-docs table name (adapter output from 01, input to 02)
+  parsed_table_suffix:
+    default: rag_parsed_docs
+  vector_search_endpoint:
+    default: one-env-shared-endpoint
+  embedding_endpoint:
+    default: databricks-bge-m3
+
+targets:
+  dev:
+    default: true
+    mode: development
+    workspace:
+      profile: DEFAULT
+      # Or set host explicitly: host: https://your-workspace.cloud.databricks.com
+    variables:
+      catalog: main
+      schema: default
+      image_dir: /Volumes/main/default/ocr_data/images
+      parsed_table_suffix: rag_parsed_docs
+      vector_search_endpoint: one-env-shared-endpoint
+      embedding_endpoint: databricks-bge-m3
+
+  prod:
+    mode: production
+    workspace:
+      profile: DEFAULT
+      # Use a separate profile for prod if needed, e.g. profile: prod
+    variables:
+      catalog: main
+      schema: default
+      image_dir: /Volumes/main/default/ocr_data/images
+      parsed_table_suffix: rag_parsed_docs
+      vector_search_endpoint: one-env-shared-endpoint
+      embedding_endpoint: databricks-bge-m3

@@ -1,0 +1,55 @@
+# PDF OCR RAG Pipeline – DAB job definition
+# Task 1: OCR + adapter (GPU). Task 2: Chunk + index (CPU).
+# Paths are relative to this file: ../ = bundle root.
+
+resources:
+  jobs:
+    pdf_ocr_rag_pipeline:
+      name: "[${bundle.target}] PDF OCR RAG Pipeline"
+      description: "OCR images (HunyuanOCR/DeepSeek-OCR), adapter to parsed-docs, chunk, and create Vector Search index. Task 1 requires GPU."
+
+      job_clusters:
+        - job_cluster_key: gpu_cluster
+          new_cluster:
+            spark_version: "14.3.x-gpu-ml-scala2.12"
+            node_type_id: g5.xlarge
+            num_workers: 1
+            data_security_mode: USER_ISOLATION
+
+        - job_cluster_key: cpu_cluster
+          new_cluster:
+            spark_version: "14.3.x-scala2.12"
+            node_type_id: i3.xlarge
+            num_workers: 0
+            data_security_mode: USER_ISOLATION
+            runtime_engine: PHOTON
+
+      permissions:
+        - level: CAN_VIEW
+          group_name: users
+
+      tasks:
+        - task_key: ocr_and_adapter
+          description: "Run OCR on images (Ray+vLLM), write OCR Delta table, adapter to parsed-docs table"
+          job_cluster_key: gpu_cluster
+          notebook_task:
+            notebook_path: ../notebooks/01-ocr-and-adapter.py
+            base_parameters:
+              uc_catalog: ${var.catalog}
+              uc_schema: ${var.schema}
+              image_dir: ${var.image_dir}
+              parsed_table: ${var.parsed_table_suffix}
+
+        - task_key: chunk_index
+          description: "Chunk parsed-docs from 01, write chunked Delta table, create/update Vector Search index"
+          depends_on:
+            - task_key: ocr_and_adapter
+          job_cluster_key: cpu_cluster
+          notebook_task:
+            notebook_path: ../notebooks/02-chunk-index.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              parsed_table_suffix: ${var.parsed_table_suffix}
+              vector_search_endpoint: ${var.vector_search_endpoint}
+              embedding_endpoint: ${var.embedding_endpoint}
