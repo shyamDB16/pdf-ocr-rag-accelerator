@@ -22,9 +22,12 @@ resources:
               pdf_dir: ${var.pdf_dir}
               image_dir: ${var.image_dir}
               save_images: ${var.save_images}
+              ocr_model: ${var.ocr_model}
               num_gpus: ${var.sgc_num_gpus}
               uc_catalog: ${var.catalog}
               uc_schema: ${var.schema}
+              uc_volume: ${var.uc_volume}
+              uc_table: ${var.uc_table}
               parsed_table: ${var.parsed_table_suffix}
           # Serverless GPU compute — notebook runs on single A10,
           # @ray_launch provisions additional remote GPUs
@@ -43,6 +46,7 @@ resources:
               parsed_table_suffix: ${var.parsed_table_suffix}
               vector_search_endpoint: ${var.vector_search_endpoint}
               embedding_endpoint: ${var.embedding_endpoint}
+          environment_key: default
 
         - task_key: rag_chain
           description: "Build RAG chain, test retrieval + generation, log model to MLflow"
@@ -55,3 +59,7 @@ resources:
               schema: ${var.schema}
               vector_search_endpoint: ${var.vector_search_endpoint}
               llm_endpoint: ${var.llm_endpoint}
+          environment_key: default
+
+      environments:
+        - environment_key: default

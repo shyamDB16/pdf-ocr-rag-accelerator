@@ -39,8 +39,11 @@ resources:
               pdf_dir: ${var.pdf_dir}
               image_dir: ${var.image_dir}
               save_images: ${var.save_images}
+              ocr_model: ${var.ocr_model}
               uc_catalog: ${var.catalog}
               uc_schema: ${var.schema}
+              uc_volume: ${var.uc_volume}
+              uc_table: ${var.uc_table}
               parsed_table: ${var.parsed_table_suffix}
 
         - task_key: chunk_index

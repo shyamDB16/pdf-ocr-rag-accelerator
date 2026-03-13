@@ -24,6 +24,15 @@ variables:
   # Whether to save rendered PNGs as a checkpoint (pdf mode only)
   save_images:
     default: "false"
+  # OCR model to use
+  ocr_model:
+    default: deepseek-ai/DeepSeek-OCR
+  # UC Volume name (for parquet output path)
+  uc_volume:
+    default: ocr_data
+  # OCR results Delta table name
+  uc_table:
+    default: ocr_inference_results
   # Parsed-docs table name (adapter output from 01, input to 02)
   parsed_table_suffix:
     default: rag_parsed_docs
