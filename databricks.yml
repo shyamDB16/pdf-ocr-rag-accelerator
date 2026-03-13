@@ -12,9 +12,18 @@ variables:
     default: main
   schema:
     default: default
-  # Where PNG images live (e.g. output of PDF→image). Set per target if needed.
+  # Input mode: "pdf" (stream PDFs in memory) or "images" (pre-existing PNGs)
+  input_mode:
+    default: pdf
+  # Where PDFs live (used when input_mode=pdf)
+  pdf_dir:
+    default: /Volumes/main/default/ocr_data/pdfs
+  # Where PNG images live (used when input_mode=images, or as checkpoint dir when save_images=true)
   image_dir:
     default: /Volumes/main/default/ocr_data/images
+  # Whether to save rendered PNGs as a checkpoint (pdf mode only)
+  save_images:
+    default: "false"
   # Parsed-docs table name (adapter output from 01, input to 02)
   parsed_table_suffix:
     default: rag_parsed_docs
@@ -22,6 +31,11 @@ variables:
     default: one-env-shared-endpoint
   embedding_endpoint:
     default: databricks-bge-m3
+  llm_endpoint:
+    default: databricks-meta-llama-3-3-70b-instruct
+  # Number of A10 GPUs for Serverless GPU Compute (SGC job only)
+  sgc_num_gpus:
+    default: "5"
 
 targets:
   dev:
@@ -33,20 +47,27 @@ targets:
     variables:
       catalog: main
       schema: default
+      input_mode: pdf
+      pdf_dir: /Volumes/main/default/ocr_data/pdfs
       image_dir: /Volumes/main/default/ocr_data/images
+      save_images: "false"
       parsed_table_suffix: rag_parsed_docs
       vector_search_endpoint: one-env-shared-endpoint
       embedding_endpoint: databricks-bge-m3
+      llm_endpoint: databricks-meta-llama-3-3-70b-instruct
 
   prod:
     mode: production
     workspace:
       profile: DEFAULT
-      # Use a separate profile for prod if needed, e.g. profile: prod
     variables:
       catalog: main
       schema: default
+      input_mode: pdf
+      pdf_dir: /Volumes/main/default/ocr_data/pdfs
       image_dir: /Volumes/main/default/ocr_data/images
+      save_images: "false"
       parsed_table_suffix: rag_parsed_docs
       vector_search_endpoint: one-env-shared-endpoint
       embedding_endpoint: databricks-bge-m3
+      llm_endpoint: databricks-meta-llama-3-3-70b-instruct

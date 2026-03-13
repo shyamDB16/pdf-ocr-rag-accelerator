@@ -1,28 +1,12 @@
-# PDF OCR RAG Pipeline – DAB job definition
-# Task 1: OCR + adapter (GPU). Task 2: Chunk + index (CPU). Task 3: RAG chain (CPU).
-# Paths are relative to this file: ../ = bundle root.
+# PDF OCR RAG Pipeline – Serverless GPU Compute (SGC) variant
+# Task 1: OCR + adapter (Serverless GPU). Task 2: Chunk + index (Serverless). Task 3: RAG chain (Serverless).
+# Uses serverless compute throughout — no cluster configuration needed.
 
 resources:
   jobs:
-    pdf_ocr_rag_pipeline:
-      name: "[${bundle.target}] PDF OCR RAG Pipeline"
-      description: "End-to-end: OCR (PDF/images), chunk + Vector Search index, RAG chain with MLflow model logging."
-
-      job_clusters:
-        - job_cluster_key: gpu_cluster
-          new_cluster:
-            spark_version: "14.3.x-gpu-ml-scala2.12"
-            node_type_id: g5.xlarge
-            num_workers: 1
-            data_security_mode: USER_ISOLATION
-
-        - job_cluster_key: cpu_cluster
-          new_cluster:
-            spark_version: "14.3.x-scala2.12"
-            node_type_id: i3.xlarge
-            num_workers: 0
-            data_security_mode: USER_ISOLATION
-            runtime_engine: PHOTON
+    pdf_ocr_rag_pipeline_sgc:
+      name: "[${bundle.target}] PDF OCR RAG Pipeline (Serverless GPU)"
+      description: "End-to-end pipeline using Serverless GPU Compute: OCR (PDF/images), chunk + Vector Search index, RAG chain with MLflow model logging."
 
       permissions:
         - level: CAN_VIEW
@@ -30,24 +14,27 @@ resources:
 
       tasks:
         - task_key: ocr_and_adapter
-          description: "OCR on PDFs/images (Ray+vLLM), adapter to parsed-docs table"
-          job_cluster_key: gpu_cluster
+          description: "OCR on PDFs/images using Serverless GPU (@ray_launch), adapter to parsed-docs table"
           notebook_task:
-            notebook_path: ../notebooks/01-ocr-and-adapter.py
+            notebook_path: ../notebooks/01b-ocr-serverless.py
             base_parameters:
               input_mode: ${var.input_mode}
               pdf_dir: ${var.pdf_dir}
               image_dir: ${var.image_dir}
               save_images: ${var.save_images}
+              num_gpus: ${var.sgc_num_gpus}
               uc_catalog: ${var.catalog}
               uc_schema: ${var.schema}
               parsed_table: ${var.parsed_table_suffix}
+          # Serverless GPU compute — notebook runs on single A10,
+          # @ray_launch provisions additional remote GPUs
+          compute:
+            hardware_accelerator: A10G
 
         - task_key: chunk_index
           description: "Chunk parsed-docs, write chunked Delta table, create/update Vector Search index"
           depends_on:
             - task_key: ocr_and_adapter
-          job_cluster_key: cpu_cluster
           notebook_task:
             notebook_path: ../notebooks/02-chunk-index.py
             base_parameters:
@@ -61,7 +48,6 @@ resources:
           description: "Build RAG chain, test retrieval + generation, log model to MLflow"
           depends_on:
             - task_key: chunk_index
-          job_cluster_key: cpu_cluster
           notebook_task:
             notebook_path: ../notebooks/03-rag-chain.py
             base_parameters:

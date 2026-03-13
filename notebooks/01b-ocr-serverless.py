@@ -1,45 +1,24 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # 1. OCR Pipeline — PDF / Image → Parsed Docs
+# MAGIC # 1b. OCR Pipeline — PDF / Image → Parsed Docs (Serverless GPU)
 # MAGIC
 # MAGIC <div style="background:#e7f3fe;border-left:6px solid #2196F3;padding:12px;margin:12px 0;border-radius:4px">
-# MAGIC <b>What this notebook does</b><br/>
-# MAGIC Runs a distributed OCR pipeline on a <b>classic Databricks GPU cluster</b> using Ray + vLLM.<br/>
-# MAGIC Supports two input modes:
-# MAGIC <ul>
-# MAGIC   <li><b>PDF mode</b> (default) — reads PDFs from a UC Volume, renders pages in memory via Ray, feeds directly to GPU OCR. No intermediate files unless you enable the image checkpoint.</li>
-# MAGIC   <li><b>Image mode</b> — reads pre-existing PNG images from a UC Volume (backward-compatible path).</li>
-# MAGIC </ul>
+# MAGIC <b>Serverless GPU variant</b><br/>
+# MAGIC Same pipeline as <code>01-ocr-and-adapter.py</code> but uses <b>Databricks Serverless GPU Compute (SGC)</b> instead of a classic GPU cluster. SGC auto-provisions remote A10 GPUs — no cluster configuration needed.
 # MAGIC </div>
 # MAGIC
-# MAGIC **Pipeline (PDF mode — streaming, no disk I/O):**
-# MAGIC ```
-# MAGIC UC Volume (PDFs)
-# MAGIC   ↓  ray.data.read_binary_files
-# MAGIC   ↓  .flat_map(render_pages)        ← CPU, PDF → PIL → PNG bytes in memory
-# MAGIC   ↓  .map_batches(OCRPredictor)     ← GPU, vLLM inference
-# MAGIC   ↓  .write_parquet(...)            ← results to UC Volume
-# MAGIC   ↓
-# MAGIC Delta table (one row per page) → Adapter → parsed-docs table (one row per document)
-# MAGIC ```
+# MAGIC **Differences from classic (01):**
+# MAGIC - Uses `@ray_launch` from `serverless_gpu.ray` to provision remote GPUs
+# MAGIC - Calls `.distributed()` to execute on provisioned workers
+# MAGIC - `num_gpus` is set explicitly (not auto-detected from cluster)
+# MAGIC - No `ray.init()` — handled by `@ray_launch`
 # MAGIC
-# MAGIC **Output:** `rag_parsed_docs` table with columns `content`, `parser_status`, `doc_uri`, `last_modified` — ready for **02-chunk-index**.
+# MAGIC **Setup:**
+# MAGIC 1. Click **Connect** → **Serverless GPU**
+# MAGIC 2. Open **Environment** side panel → set **Accelerator** to **A10**
+# MAGIC 3. Click **Apply** and **Confirm**
 # MAGIC
-# MAGIC **Next →** Run `02-chunk-index.py` to chunk and build the Vector Search index.
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Cluster Setup
-# MAGIC
-# MAGIC <div style="background:#fff3cd;border-left:6px solid #ffc107;padding:12px;margin:12px 0;border-radius:4px">
-# MAGIC <b>Prerequisites</b>
-# MAGIC <ol>
-# MAGIC   <li>Classic Databricks GPU cluster (e.g. <code>g5.xlarge</code>, 1+ workers)</li>
-# MAGIC   <li>Databricks Runtime <b>14.3 LTS ML</b> or later (Ray support)</li>
-# MAGIC   <li>PDFs or PNG images uploaded to a Unity Catalog Volume</li>
-# MAGIC </ol>
-# MAGIC </div>
+# MAGIC **Output:** Same `rag_parsed_docs` table as notebook 01 — notebooks 02 and 03 work unchanged.
 
 # COMMAND ----------
 
@@ -87,48 +66,12 @@ print("\n✓ All version checks passed!")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Initialize Ray
-
-# COMMAND ----------
-
-import os
-import json
-
-os.environ['RAY_TEMP_DIR'] = '/tmp/ray'
-
-if not ray.is_initialized():
-    ray.init(
-        ignore_reinit_error=True,
-        runtime_env={"env_vars": {"RAY_TEMP_DIR": "/tmp/ray"}}
-    )
-    print("✓ Ray initialized")
-else:
-    print("✓ Ray already initialized")
-
-# Display cluster resources
-cluster_resources = ray.cluster_resources()
-print(f"\nRay Cluster Resources: {json.dumps(cluster_resources, indent=2)}")
-
-nodes = ray.nodes()
-print(f"\nDetected {len(nodes)} Ray node(s):")
-for node in nodes:
-    node_id = node.get("NodeID", "N/A")[:8]
-    ip = node.get("NodeManagerAddress", "N/A")
-    gpus = int(node.get("Resources", {}).get("GPU", 0))
-    print(f"  • Node {node_id}... | IP: {ip} | GPUs: {gpus}")
-
-
-# COMMAND ----------
-
-# MAGIC %md
 # MAGIC ## Configuration
 # MAGIC
-# MAGIC <div style="background:#e7f3fe;border-left:6px solid #2196F3;padding:12px;margin:12px 0;border-radius:4px">
-# MAGIC <b>Input mode</b>
-# MAGIC <ul>
-# MAGIC   <li><code>pdf</code> — point <code>pdf_dir</code> at a UC Volume directory containing <code>.pdf</code> files. Pages are rendered in memory and streamed directly to OCR. Set <code>save_images = true</code> to also write PNGs to <code>image_dir</code> as a checkpoint.</li>
-# MAGIC   <li><code>images</code> — point <code>image_dir</code> at a directory of PNGs already named <code>{docname}_page_{N}.png</code>.</li>
-# MAGIC </ul>
+# MAGIC <div style="background:#fff3cd;border-left:6px solid #ffc107;padding:12px;margin:12px 0;border-radius:4px">
+# MAGIC <b>SGC note</b><br/>
+# MAGIC <code>num_gpus</code> sets how many remote A10 GPUs <code>@ray_launch</code> provisions.
+# MAGIC The notebook itself runs on a single A10 for orchestration; the heavy OCR work runs on the provisioned workers.
 # MAGIC </div>
 
 # COMMAND ----------
@@ -145,6 +88,7 @@ dbutils.widgets.dropdown("ocr_model", "deepseek-ai/DeepSeek-OCR",
                          ["tencent/HunyuanOCR", "deepseek-ai/DeepSeek-OCR"],
                          "OCR Model")
 dbutils.widgets.text("batch_size", "4", "Batch Size")
+dbutils.widgets.text("num_gpus", "5", "Number of A10 GPUs to provision")
 dbutils.widgets.text("hf_secret_scope", "", "HF Secret Scope (optional)")
 dbutils.widgets.text("hf_secret_key", "", "HF Secret Key (optional)")
 
@@ -157,7 +101,8 @@ dbutils.widgets.text("parsed_table", "rag_parsed_docs", "Parsed Docs Table (adap
 
 # COMMAND ----------
 
-# Retrieve widget values
+import os
+
 INPUT_MODE = dbutils.widgets.get("input_mode")
 PDF_DIR = dbutils.widgets.get("pdf_dir")
 IMAGE_DIR = dbutils.widgets.get("image_dir")
@@ -166,6 +111,7 @@ RENDER_DPI = int(dbutils.widgets.get("render_dpi"))
 
 OCR_MODEL = dbutils.widgets.get("ocr_model")
 BATCH_SIZE = int(dbutils.widgets.get("batch_size"))
+NUM_GPUS = int(dbutils.widgets.get("num_gpus"))
 HF_SECRET_SCOPE = dbutils.widgets.get("hf_secret_scope")
 HF_SECRET_KEY = dbutils.widgets.get("hf_secret_key")
 
@@ -175,15 +121,10 @@ UC_VOLUME = dbutils.widgets.get("uc_volume")
 UC_TABLE = dbutils.widgets.get("uc_table")
 PARSED_TABLE_SUFFIX = dbutils.widgets.get("parsed_table").strip() or "rag_parsed_docs"
 
-# Construct paths
 UC_VOLUME_PATH = f"/Volumes/{UC_CATALOG}/{UC_SCHEMA}/{UC_VOLUME}"
 UC_TABLE_NAME = f"{UC_CATALOG}.{UC_SCHEMA}.{UC_TABLE}"
 PARSED_TABLE_NAME = f"{UC_CATALOG}.{UC_SCHEMA}.{PARSED_TABLE_SUFFIX}"
 PARQUET_OUTPUT_PATH = f"{UC_VOLUME_PATH}/ocr_inference_output"
-
-# Detect GPUs
-available_gpus = int(ray.cluster_resources().get("GPU", 0))
-NUM_GPUS = available_gpus if available_gpus > 0 else 1
 
 print(f"Input Mode:       {INPUT_MODE}")
 if INPUT_MODE == "pdf":
@@ -193,7 +134,7 @@ if INPUT_MODE == "pdf":
 else:
     print(f"Image Directory:  {IMAGE_DIR}")
 print(f"OCR Model:        {OCR_MODEL}")
-print(f"Available GPUs:   {NUM_GPUS} (auto-detected)")
+print(f"Num GPUs (SGC):   {NUM_GPUS}")
 print(f"Batch Size:       {BATCH_SIZE}")
 print(f"\nUC Volume:        {UC_VOLUME_PATH}")
 print(f"OCR Table:        {UC_TABLE_NAME}")
@@ -205,8 +146,6 @@ print(f"Parquet Output:   {PARQUET_OUTPUT_PATH}")
 
 # MAGIC %md
 # MAGIC ## Model configuration
-# MAGIC
-# MAGIC Per-model settings for vLLM and sampling. HunyuanOCR uses `AutoProcessor` for the chat template; DeepSeek-OCR uses a raw image prompt with n-gram logits processor.
 
 # COMMAND ----------
 
@@ -217,7 +156,7 @@ MODEL_CONFIGS = {
             dtype="bfloat16",
             max_model_len=32768,
             max_num_seqs=6,
-            gpu_memory_utilization=0.80,
+            gpu_memory_utilization=0.90,
             mm_processor_cache_gb=0,
             enable_prefix_caching=False,
         ),
@@ -230,7 +169,7 @@ MODEL_CONFIGS = {
             dtype="bfloat16",
             max_model_len=8192,
             max_num_seqs=6,
-            gpu_memory_utilization=0.80,
+            gpu_memory_utilization=0.90,
             mm_processor_cache_gb=0,
             enable_prefix_caching=False,
         ),
@@ -255,19 +194,18 @@ print(f"  max_model_len={cfg['llm_kwargs']['max_model_len']}, max_tokens={cfg['s
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Pipeline components
+# MAGIC ## Define the distributed OCR pipeline (SGC)
 # MAGIC
 # MAGIC <div style="background:#d4edda;border-left:6px solid #28a745;padding:12px;margin:12px 0;border-radius:4px">
-# MAGIC <b>Streaming architecture (PDF mode)</b><br/>
-# MAGIC Ray Data's streaming executor applies <b>backpressure</b> — pages are rendered only as fast as the GPU can consume them. This keeps memory bounded regardless of corpus size.
+# MAGIC <b>How SGC works</b><br/>
+# MAGIC <code>@ray_launch(gpus=N, gpu_type='a10', remote=True)</code> provisions <b>N remote A10 GPUs</b>.
+# MAGIC The decorated function runs on the Ray cluster with those GPUs available.
+# MAGIC Call <code>.distributed()</code> to launch — initial startup may take a few minutes as GPU nodes are provisioned and models are loaded.
 # MAGIC </div>
-# MAGIC
-# MAGIC Two components:
-# MAGIC 1. **`render_pages`** — CPU flat-map: PDF bytes → list of `(image_bytes, doc_uri, page_num)` rows
-# MAGIC 2. **`OCRPredictor`** — GPU map-batches: image bytes → OCR text via vLLM
 
 # COMMAND ----------
 
+from serverless_gpu.ray import ray_launch
 import io
 import re
 import glob
@@ -277,71 +215,64 @@ from datetime import datetime
 from PIL import Image
 from vllm import LLM, SamplingParams
 
-# ---------------------------------------------------------------------------
-# 1. Page renderer (PDF mode) — runs on CPU workers
-# ---------------------------------------------------------------------------
-def make_render_fn(dpi: int, save_images: bool, image_output_dir: str):
-    """Returns a flat_map function that renders PDF pages to PNG bytes."""
-    import fitz  # PyMuPDF — imported inside so Ray can serialize the closure
 
-    zoom = dpi / 72.0
-    mat_val = (zoom, zoom)
+@ray_launch(gpus=NUM_GPUS, gpu_type='a10', remote=True)
+def run_ocr_pipeline():
+    """Distributed OCR pipeline on Serverless GPU — streaming PDF or image input."""
 
-    def render_pages(row):
-        pdf_bytes = row["bytes"]
-        pdf_path = row["path"]
-        doc_stem = Path(pdf_path).stem
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        mat = fitz.Matrix(*mat_val)
-        results = []
+    _model_name = OCR_MODEL
+    _cfg = MODEL_CONFIGS[_model_name]
 
-        for page_idx in range(len(doc)):
-            page = doc[page_idx]
-            pix = page.get_pixmap(matrix=mat)
-            img_bytes = pix.tobytes("png")
+    # --- Page renderer (PDF mode) ---
+    def make_render_fn(dpi, save_images, image_output_dir):
+        import fitz
 
-            if save_images:
-                out_path = os.path.join(image_output_dir, f"{doc_stem}_page_{page_idx + 1}.png")
-                pix.save(out_path)
+        zoom = dpi / 72.0
+        mat_val = (zoom, zoom)
 
-            results.append({
-                "image_bytes": img_bytes,
-                "doc_uri": doc_stem,
-                "page_num": page_idx + 1,
-            })
+        def render_pages(row):
+            pdf_bytes = row["bytes"]
+            pdf_path = row["path"]
+            doc_stem = Path(pdf_path).stem
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            mat = fitz.Matrix(*mat_val)
+            results = []
 
-        doc.close()
-        return results
+            for page_idx in range(len(doc)):
+                page = doc[page_idx]
+                pix = page.get_pixmap(matrix=mat)
+                img_bytes = pix.tobytes("png")
 
-    return render_pages
+                if save_images:
+                    out_path = os.path.join(image_output_dir, f"{doc_stem}_page_{page_idx + 1}.png")
+                    pix.save(out_path)
 
+                results.append({
+                    "image_bytes": img_bytes,
+                    "doc_uri": doc_stem,
+                    "page_num": page_idx + 1,
+                })
 
-# ---------------------------------------------------------------------------
-# 2. Image normalizer (image mode) — reads PNGs, extracts doc_uri + page_num
-# ---------------------------------------------------------------------------
-def normalize_image_row(row):
-    """Normalize a PNG file row to the same schema as render_pages output."""
-    path = row["path"]
-    stem = Path(path).stem
-    match = re.match(r"(.+)_page_(\d+)$", stem)
-    doc_uri = match.group(1) if match else stem
-    page_num = int(match.group(2)) if match else 1
+            doc.close()
+            return results
 
-    with open(path, "rb") as f:
-        image_bytes = f.read()
+        return render_pages
 
-    return {"image_bytes": image_bytes, "doc_uri": doc_uri, "page_num": page_num}
+    # --- Image normalizer (image mode) ---
+    def normalize_image_row(row):
+        path = row["path"]
+        stem = Path(path).stem
+        match = re.match(r"(.+)_page_(\d+)$", stem)
+        doc_uri = match.group(1) if match else stem
+        page_num = int(match.group(2)) if match else 1
 
+        with open(path, "rb") as f:
+            image_bytes = f.read()
 
-# ---------------------------------------------------------------------------
-# 3. OCR predictor — runs on GPU workers (1 GPU each)
-# ---------------------------------------------------------------------------
-def make_ocr_predictor(model_name: str, model_configs: dict):
-    """Returns an OCRPredictor class configured for the given model."""
-    _model_name = model_name
-    _cfg = model_configs[_model_name]
+        return {"image_bytes": image_bytes, "doc_uri": doc_uri, "page_num": page_num}
 
-    def _clean_repeated_substrings(text: str) -> str:
+    # --- Post-processing ---
+    def _clean_repeated_substrings(text):
         n = len(text)
         if n < 8000:
             return text
@@ -355,11 +286,12 @@ def make_ocr_predictor(model_name: str, model_configs: dict):
                 return text[: n - length * (count - 1)]
         return text
 
-    def _postprocess(text: str) -> str:
+    def _postprocess(text):
         if _model_name == "tencent/HunyuanOCR":
             return _clean_repeated_substrings(text)
         return text
 
+    # --- OCR predictor ---
     class OCRPredictor:
         def __init__(self):
             llm_kw = dict(model=_model_name, **_cfg["llm_kwargs"])
@@ -375,7 +307,7 @@ def make_ocr_predictor(model_name: str, model_configs: dict):
                 self.processor = AutoProcessor.from_pretrained(_model_name)
             print(f"✓ OCRPredictor initialized with {_model_name}")
 
-        def _build_input(self, image_bytes: bytes) -> dict:
+        def _build_input(self, image_bytes):
             img = Image.open(io.BytesIO(image_bytes))
             if self.model_name == "tencent/HunyuanOCR":
                 user_prompt = (
@@ -401,7 +333,7 @@ def make_ocr_predictor(model_name: str, model_configs: dict):
                 prompt = "<image>\nConvert the document to markdown. Think Carefully"
                 return {"prompt": prompt, "multi_modal_data": {"image": img}}
 
-        def __call__(self, batch: dict) -> dict:
+        def __call__(self, batch):
             image_bytes_list = batch["image_bytes"].tolist()
             doc_uris = batch["doc_uri"].tolist()
             page_nums = batch["page_num"].tolist()
@@ -420,21 +352,7 @@ def make_ocr_predictor(model_name: str, model_configs: dict):
                 "timestamp": [ts] * len(ocr_texts),
             }
 
-    return OCRPredictor
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Run the OCR pipeline
-# MAGIC
-# MAGIC Builds the Ray Data pipeline based on `input_mode`, executes it, and writes Parquet.
-
-# COMMAND ----------
-
-def run_pipeline():
-    """Build and execute the OCR pipeline (PDF streaming or image mode)."""
-
-    # --- Build the Ray Dataset ---
+    # ---- Build the Ray Dataset ----
     if INPUT_MODE == "pdf":
         print(f"📄 PDF mode — reading from {PDF_DIR}")
         ds = ray.data.read_binary_files(PDF_DIR, include_paths=True)
@@ -463,8 +381,7 @@ def run_pipeline():
         )
         ds = ds.map(normalize_image_row)
 
-    # --- OCR inference (GPU) ---
-    OCRPredictor = make_ocr_predictor(OCR_MODEL, MODEL_CONFIGS)
+    # ---- OCR inference (GPU) ----
     ds = ds.map_batches(
         OCRPredictor,
         concurrency=(1, NUM_GPUS),
@@ -473,12 +390,12 @@ def run_pipeline():
         num_cpus=12,
     )
 
-    # --- Write results ---
+    # ---- Write results ----
     print(f"\nWriting results to {PARQUET_OUTPUT_PATH}")
     ds.write_parquet(PARQUET_OUTPUT_PATH, mode="overwrite")
     print("✓ Parquet written")
 
-    # --- Preview ---
+    # ---- Preview ----
     samples = ray.data.read_parquet(PARQUET_OUTPUT_PATH).take(limit=5)
     print("\n" + "=" * 60)
     print("SAMPLE OCR RESULTS")
@@ -491,8 +408,19 @@ def run_pipeline():
 
     return PARQUET_OUTPUT_PATH
 
+# COMMAND ----------
 
-parquet_path = run_pipeline()
+# MAGIC %md
+# MAGIC ## Run distributed OCR on Serverless GPU
+# MAGIC
+# MAGIC <div style="background:#fff3cd;border-left:6px solid #ffc107;padding:12px;margin:12px 0;border-radius:4px">
+# MAGIC <b>Startup time</b><br/>
+# MAGIC Initial launch may take a few minutes as remote A10 GPU nodes are provisioned and models are loaded. Subsequent runs on a warm cluster are faster.
+# MAGIC </div>
+
+# COMMAND ----------
+
+parquet_path = run_ocr_pipeline.distributed()
 print(f"\n✓ OCR inference complete → {parquet_path}")
 
 # COMMAND ----------
@@ -522,10 +450,7 @@ display(df_spark.limit(10))
 # MAGIC %md
 # MAGIC ## Adapter: OCR table → parsed-docs shape
 # MAGIC
-# MAGIC <div style="background:#f8d7da;border-left:6px solid #dc3545;padding:12px;margin:12px 0;border-radius:4px">
-# MAGIC <b>Why this matters</b><br/>
-# MAGIC The OCR table has <b>one row per page</b>. Downstream chunking (notebook 02) expects <b>one row per document</b> with columns <code>content</code>, <code>parser_status</code>, <code>doc_uri</code>, <code>last_modified</code>. The adapter aggregates pages in order and writes the parsed-docs table.
-# MAGIC </div>
+# MAGIC Aggregates page-level OCR rows into one row per document — same output as notebook 01 (classic). Notebooks 02 and 03 work unchanged.
 
 # COMMAND ----------
 
