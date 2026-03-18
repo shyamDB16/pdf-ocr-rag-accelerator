@@ -1,15 +1,7 @@
 # PDF OCR RAG Accelerator – dependencies
-# Notebook 01 (OCR) is run on a GPU cluster with torch, vllm, ray, etc. (see 01-ocr-and-adapter.py install cell).
-# Notebook 02 and scripts use the below.
+# Notebook 01 installs GPU deps (torch, vllm, ray, flash-attn) via %pip in-notebook.
+# The packages below are used by notebook 02 and for local development.
 
-# Chunking (02-chunk-index)
 langchain-text-splitters>=0.2.0
-
-# Databricks (Vector Search API)
 databricks-sdk>=0.20.0
-
-# PDF→image helper (e.g. in 01-ocr-and-adapter or prep scripts)
 PyMuPDF>=1.23.0
-
-# Config loading for scripts
-pyyaml>=6.0

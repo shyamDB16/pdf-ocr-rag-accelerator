@@ -1,19 +1,12 @@
 # Databricks notebook source
 # MAGIC %md
 # MAGIC # 2. Chunk and index
-# MAGIC
-# MAGIC Reads the parsed-docs Delta table from **01** (OCR+adapter), chunks each document with a character-based splitter, writes a chunked Delta table (with CDC enabled), and creates a Vector Search index using Delta Sync.
-# MAGIC
-# MAGIC **Prerequisite:** Run `01-ocr-and-adapter.py`, then set catalog/schema/parsed_table_suffix below to match 01's output table.
-# MAGIC
-# MAGIC **Output:** A chunked Delta table (`chunk_id`, `content_chunked`, `doc_uri`, …) and a Vector Search index on the same table.
+# MAGIC Chunks parsed docs from notebook 01, writes a chunked Delta table with CDC, and creates a Vector Search index via Delta Sync.
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Config
-# MAGIC
-# MAGIC Use the same catalog/schema as 01. Set the parsed table name to the output of 01. Configure chunked table name, vector search endpoint, and embedding model endpoint.
 
 # COMMAND ----------
 
@@ -48,8 +41,6 @@ print(f"Vector index: {VECTOR_INDEX_NAME}")
 
 # MAGIC %md
 # MAGIC ## Install chunking dependency
-# MAGIC
-# MAGIC We use character-based chunking (no tokenizer) so no embedding-model dependency is required for this step.
 
 # COMMAND ----------
 
@@ -57,6 +48,18 @@ print(f"Vector index: {VECTOR_INDEX_NAME}")
 # MAGIC dbutils.library.restartPython()
 
 # COMMAND ----------
+
+# Re-read config after restartPython
+CATALOG = dbutils.widgets.get("catalog")
+SCHEMA = dbutils.widgets.get("schema")
+parsed_suffix = dbutils.widgets.get("parsed_table_suffix").strip() or "rag_parsed_docs"
+PARSED_TABLE = f"{CATALOG}.{SCHEMA}.{parsed_suffix}"
+CHUNKED_TABLE = f"{CATALOG}.{SCHEMA}.rag_docs_chunked"
+VECTOR_INDEX_NAME = f"{CATALOG}.{SCHEMA}.rag_docs_chunked_index"
+VECTOR_SEARCH_ENDPOINT = dbutils.widgets.get("vector_search_endpoint")
+EMBEDDING_ENDPOINT = dbutils.widgets.get("embedding_endpoint")
+CHUNK_SIZE = int(dbutils.widgets.get("chunk_size"))
+CHUNK_OVERLAP = int(dbutils.widgets.get("chunk_overlap"))
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pyspark.sql import functions as F
@@ -91,15 +94,13 @@ n_chunks = spark.table(CHUNKED_TABLE).count()
 print(f"Wrote {n_chunks} chunks to {CHUNKED_TABLE}")
 
 spark.sql(f"ALTER TABLE {CHUNKED_TABLE} SET TBLPROPERTIES (delta.enableChangeDataFeed = true)")
-print("CDC enabled for Vector Search sync.")
+print("CDC enabled on chunked table.")
 display(spark.table(CHUNKED_TABLE))
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Create Vector Search index (Delta Sync)
-# MAGIC
-# MAGIC Creates a vector index on the chunked table. Embeddings are computed by the specified embedding endpoint. Index name and endpoint must already exist or be created in the workspace.
 
 # COMMAND ----------
 
@@ -182,4 +183,4 @@ is_error, msg = build_retriever_index(
 if is_error:
     raise Exception(msg)
 print(msg)
-print("Note: Index may still be syncing. Check the Vector Search UI for status.")
+print("Index may still be syncing -- check the Vector Search UI for status.")

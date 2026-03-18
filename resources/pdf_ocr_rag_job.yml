@@ -11,17 +11,20 @@ resources:
       job_clusters:
         - job_cluster_key: gpu_cluster
           new_cluster:
-            spark_version: "14.3.x-gpu-ml-scala2.12"
+            spark_version: "17.3.x-gpu-ml-scala2.13"
             node_type_id: g5.xlarge
             num_workers: 1
-            data_security_mode: USER_ISOLATION
+            data_security_mode: SINGLE_USER
+            spark_env_vars:
+              VLLM_USE_V1: "0"
+              VLLM_ENABLE_V1_MULTIPROCESSING: "0"
 
         - job_cluster_key: cpu_cluster
           new_cluster:
-            spark_version: "14.3.x-scala2.12"
+            spark_version: "17.3.x-scala2.13"
             node_type_id: i3.xlarge
-            num_workers: 0
-            data_security_mode: USER_ISOLATION
+            num_workers: 2
+            data_security_mode: SINGLE_USER
             runtime_engine: PHOTON
 
       permissions:
@@ -40,6 +43,8 @@ resources:
               image_dir: ${var.image_dir}
               save_images: ${var.save_images}
               ocr_model: ${var.ocr_model}
+              hf_secret_scope: ${var.hf_secret_scope}
+              hf_secret_key: ${var.hf_secret_key}
               uc_catalog: ${var.catalog}
               uc_schema: ${var.schema}
               uc_volume: ${var.uc_volume}
@@ -59,16 +64,5 @@ resources:
               parsed_table_suffix: ${var.parsed_table_suffix}
               vector_search_endpoint: ${var.vector_search_endpoint}
               embedding_endpoint: ${var.embedding_endpoint}
-
-        - task_key: rag_chain
-          description: "Build RAG chain, test retrieval + generation, log model to MLflow"
-          depends_on:
-            - task_key: chunk_index
-          job_cluster_key: cpu_cluster
-          notebook_task:
-            notebook_path: ../notebooks/03-rag-chain.py
-            base_parameters:
-              catalog: ${var.catalog}
-              schema: ${var.schema}
-              vector_search_endpoint: ${var.vector_search_endpoint}
-              llm_endpoint: ${var.llm_endpoint}
+              chunk_size: "500"
+              chunk_overlap: "50"

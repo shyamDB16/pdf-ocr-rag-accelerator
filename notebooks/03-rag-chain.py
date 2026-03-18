@@ -80,7 +80,6 @@ from databricks_langchain import DatabricksVectorSearch
 vector_store = DatabricksVectorSearch(
     endpoint=VECTOR_SEARCH_ENDPOINT,
     index_name=VECTOR_INDEX_NAME,
-    text_column="content_chunked",
     columns=["chunk_id", "content_chunked", "doc_uri"],
 )
 
@@ -455,24 +454,87 @@ for doc in result["source_documents"]:
 # COMMAND ----------
 
 import mlflow
-from mlflow.models import infer_signature
+import tempfile, textwrap, os
 
 mlflow.set_registry_uri("databricks-uc")
 
 MODEL_NAME = f"{CATALOG}.{SCHEMA}.pdf_ocr_rag_chain"
 
-# Infer signature from a sample
-sample_input = "What are the key findings?"
-sample_output = rag_chain.invoke(sample_input)
-signature = infer_signature(sample_input, sample_output)
+# --- Write chain code to a temporary file (models-from-code pattern) ---
+# LangChain v1 + MLflow requires the model be defined in a standalone Python file.
+chain_code = textwrap.dedent(f"""\
+    import os
+    from databricks_langchain import ChatDatabricks, DatabricksVectorSearch
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_core.output_parsers import StrOutputParser
+    from langchain_core.runnables import RunnablePassthrough
+    import mlflow
 
+    mlflow.langchain.autolog()
+
+    vector_store = DatabricksVectorSearch(
+        endpoint="{VECTOR_SEARCH_ENDPOINT}",
+        index_name="{VECTOR_INDEX_NAME}",
+        columns=["chunk_id", "content_chunked", "doc_uri"],
+    )
+    retriever = vector_store.as_retriever(search_kwargs={{"k": {NUM_RESULTS}}})
+
+    llm = ChatDatabricks(
+        endpoint="{LLM_ENDPOINT}",
+        temperature=0.1,
+        max_tokens=1024,
+    )
+
+    RAG_PROMPT = ChatPromptTemplate.from_messages([
+        ("system", \"\"\"You are a helpful assistant that answers questions based on the provided document context.
+
+    Instructions:
+    - Use ONLY the information in the context below to answer the question.
+    - If the context does not contain enough information, say "I don't have enough information in the provided documents to answer this question."
+    - Cite the source document when possible (use the doc_uri).
+    - Be concise and direct.\"\"\"),
+        ("human", \"\"\"Context from retrieved documents:
+
+    {{context}}
+
+    ---
+
+    Question: {{question}}\"\"\"),
+    ])
+
+    def format_docs(docs):
+        formatted = []
+        for i, doc in enumerate(docs, 1):
+            source = doc.metadata.get("doc_uri", "unknown")
+            formatted.append(f"[{{i}}] (Source: {{source}})\\n{{doc.page_content}}")
+        return "\\n\\n---\\n\\n".join(formatted)
+
+    chain = (
+        {{
+            "context": retriever | format_docs,
+            "question": RunnablePassthrough(),
+        }}
+        | RAG_PROMPT
+        | llm
+        | StrOutputParser()
+    )
+
+    mlflow.models.set_model(chain)
+""")
+
+chain_code_dir = tempfile.mkdtemp()
+chain_code_path = os.path.join(chain_code_dir, "chain.py")
+with open(chain_code_path, "w") as f:
+    f.write(chain_code)
+
+print(f"✓ Chain code written to {chain_code_path}")
+
+# --- Log the model ---
 with mlflow.start_run(run_name="pdf_ocr_rag_chain") as run:
     model_info = mlflow.langchain.log_model(
-        lc_model=rag_chain,
+        lc_model=chain_code_path,
         artifact_path="rag_chain",
         registered_model_name=MODEL_NAME,
-        input_example=sample_input,
-        signature=signature,
     )
     print(f"✓ Model logged: {model_info.model_uri}")
     print(f"  Run ID: {run.info.run_id}")

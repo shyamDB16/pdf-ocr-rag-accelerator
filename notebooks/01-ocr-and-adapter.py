@@ -2,44 +2,18 @@
 # MAGIC %md
 # MAGIC # 1. OCR Pipeline — PDF / Image → Parsed Docs
 # MAGIC
-# MAGIC <div style="background:#e7f3fe;border-left:6px solid #2196F3;padding:12px;margin:12px 0;border-radius:4px">
-# MAGIC <b>What this notebook does</b><br/>
-# MAGIC Runs a distributed OCR pipeline on a <b>classic Databricks GPU cluster</b> using Ray + vLLM.<br/>
-# MAGIC Supports two input modes:
-# MAGIC <ul>
-# MAGIC   <li><b>PDF mode</b> (default) — reads PDFs from a UC Volume, renders pages in memory via Ray, feeds directly to GPU OCR. No intermediate files unless you enable the image checkpoint.</li>
-# MAGIC   <li><b>Image mode</b> — reads pre-existing PNG images from a UC Volume (backward-compatible path).</li>
-# MAGIC </ul>
-# MAGIC </div>
+# MAGIC Distributed OCR on a classic Databricks GPU cluster using Ray + vLLM.
+# MAGIC Two input modes: **PDF** (default, streams pages in memory) and **images** (reads pre-existing PNGs).
 # MAGIC
-# MAGIC **Pipeline (PDF mode — streaming, no disk I/O):**
-# MAGIC ```
-# MAGIC UC Volume (PDFs)
-# MAGIC   ↓  ray.data.read_binary_files
-# MAGIC   ↓  .flat_map(render_pages)        ← CPU, PDF → PIL → PNG bytes in memory
-# MAGIC   ↓  .map_batches(OCRPredictor)     ← GPU, vLLM inference
-# MAGIC   ↓  .write_parquet(...)            ← results to UC Volume
-# MAGIC   ↓
-# MAGIC Delta table (one row per page) → Adapter → parsed-docs table (one row per document)
-# MAGIC ```
+# MAGIC **Pipeline (PDF mode):** `read_binary_files → flat_map(render_pages) → map_batches(OCRPredictor) → write_parquet → Delta → adapter → parsed-docs`
 # MAGIC
-# MAGIC **Output:** `rag_parsed_docs` table with columns `content`, `parser_status`, `doc_uri`, `last_modified` — ready for **02-chunk-index**.
-# MAGIC
-# MAGIC **Next →** Run `02-chunk-index.py` to chunk and build the Vector Search index.
+# MAGIC **Output:** `rag_parsed_docs` table ready for **02-chunk-index**.
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Cluster Setup
-# MAGIC
-# MAGIC <div style="background:#fff3cd;border-left:6px solid #ffc107;padding:12px;margin:12px 0;border-radius:4px">
-# MAGIC <b>Prerequisites</b>
-# MAGIC <ol>
-# MAGIC   <li>Classic Databricks GPU cluster (e.g. <code>g5.xlarge</code>, 1+ workers)</li>
-# MAGIC   <li>Databricks Runtime <b>14.3 LTS ML</b> or later (Ray support)</li>
-# MAGIC   <li>PDFs or PNG images uploaded to a Unity Catalog Volume</li>
-# MAGIC </ol>
-# MAGIC </div>
+# MAGIC Requires a classic GPU cluster (e.g. g5.xlarge), DBR 14.3 LTS ML+, and PDFs/PNGs in a UC Volume.
 
 # COMMAND ----------
 
@@ -48,23 +22,24 @@
 
 # COMMAND ----------
 
-# Pre-compiled Flash Attention for A10s
-%pip install --no-cache-dir "torch==2.9.0+cu128" --index-url https://download.pytorch.org/whl/cu128
-%pip install -U --no-cache-dir wheel ninja packaging
-%pip install --force-reinstall --no-cache-dir --no-build-isolation flash-attn
-%pip install einops hf_transfer
-%pip install "ray[data]>=2.47.1"
+# Only install what's not in ML Runtime 17.3 LTS:
+%pip install "vllm==0.13.0" "pymupdf>=1.23.0" einops hf_transfer --quiet
+%pip install flash-attn --no-build-isolation --quiet
 
-# vLLM with all dependencies
-%pip install "vllm==0.13.0"
-
-# PDF and image processing
-%pip install pdf2image Pillow "pymupdf>=1.23.0"
+# Remove OpenCV — mistral_common imports it, but cv2 crashes with SIGABRT on DBR (FIPS self-test).
+%pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python 2>/dev/null; true
 
 %restart_python
 
 
 # COMMAND ----------
+
+import os, sys, types
+os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"  # Force in-process engine (no subprocess)
+
+# Mock broken flash_attn_2_cuda .so — vLLM only needs the pure-Triton parts.
+if "flash_attn_2_cuda" not in sys.modules:
+    sys.modules["flash_attn_2_cuda"] = types.ModuleType("flash_attn_2_cuda")
 
 from packaging.version import Version
 import torch
@@ -81,13 +56,13 @@ print(f"Ray: {ray.__version__}")
 print(f"Transformers: {transformers.__version__}")
 
 assert Version(ray.__version__) >= Version("2.47.1"), "Ray version must be at least 2.47.1"
-print("\n✓ All version checks passed!")
+print("\nAll version checks passed.")
 
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Initialize Ray
+# MAGIC ## Ray init
 
 # COMMAND ----------
 
@@ -99,13 +74,16 @@ os.environ['RAY_TEMP_DIR'] = '/tmp/ray'
 if not ray.is_initialized():
     ray.init(
         ignore_reinit_error=True,
-        runtime_env={"env_vars": {"RAY_TEMP_DIR": "/tmp/ray"}}
+        runtime_env={"env_vars": {
+            "RAY_TEMP_DIR": "/tmp/ray",
+            "VLLM_USE_V1": "0",
+            "VLLM_ENABLE_V1_MULTIPROCESSING": "0",  # force in-process engine core (no subprocess)
+        }}
     )
-    print("✓ Ray initialized")
+    print("Ray initialized")
 else:
-    print("✓ Ray already initialized")
+    print("Ray already initialized")
 
-# Display cluster resources
 cluster_resources = ray.cluster_resources()
 print(f"\nRay Cluster Resources: {json.dumps(cluster_resources, indent=2)}")
 
@@ -115,32 +93,23 @@ for node in nodes:
     node_id = node.get("NodeID", "N/A")[:8]
     ip = node.get("NodeManagerAddress", "N/A")
     gpus = int(node.get("Resources", {}).get("GPU", 0))
-    print(f"  • Node {node_id}... | IP: {ip} | GPUs: {gpus}")
+    print(f"  Node {node_id}... | IP: {ip} | GPUs: {gpus}")
 
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Configuration
-# MAGIC
-# MAGIC <div style="background:#e7f3fe;border-left:6px solid #2196F3;padding:12px;margin:12px 0;border-radius:4px">
-# MAGIC <b>Input mode</b>
-# MAGIC <ul>
-# MAGIC   <li><code>pdf</code> — point <code>pdf_dir</code> at a UC Volume directory containing <code>.pdf</code> files. Pages are rendered in memory and streamed directly to OCR. Set <code>save_images = true</code> to also write PNGs to <code>image_dir</code> as a checkpoint.</li>
-# MAGIC   <li><code>images</code> — point <code>image_dir</code> at a directory of PNGs already named <code>{docname}_page_{N}.png</code>.</li>
-# MAGIC </ul>
-# MAGIC </div>
+# MAGIC `pdf` mode reads PDFs and streams pages to OCR. `images` mode reads pre-existing PNGs.
 
 # COMMAND ----------
 
-# --- Input mode ---
 dbutils.widgets.dropdown("input_mode", "pdf", ["pdf", "images"], "Input Mode")
 dbutils.widgets.text("pdf_dir", "/Volumes/main/default/ocr_data/pdfs", "PDF Directory")
 dbutils.widgets.text("image_dir", "/Volumes/main/default/ocr_data/images", "Image Directory")
 dbutils.widgets.dropdown("save_images", "false", ["true", "false"], "Save rendered PNGs (checkpoint)")
 dbutils.widgets.text("render_dpi", "300", "Render DPI (PDF mode)")
 
-# --- OCR model ---
 dbutils.widgets.dropdown("ocr_model", "deepseek-ai/DeepSeek-OCR",
                          ["tencent/HunyuanOCR", "deepseek-ai/DeepSeek-OCR"],
                          "OCR Model")
@@ -148,7 +117,6 @@ dbutils.widgets.text("batch_size", "4", "Batch Size")
 dbutils.widgets.text("hf_secret_scope", "", "HF Secret Scope (optional)")
 dbutils.widgets.text("hf_secret_key", "", "HF Secret Key (optional)")
 
-# --- Unity Catalog ---
 dbutils.widgets.text("uc_catalog", "main", "UC Catalog")
 dbutils.widgets.text("uc_schema", "default", "UC Schema")
 dbutils.widgets.text("uc_volume", "ocr_data", "UC Volume")
@@ -157,7 +125,6 @@ dbutils.widgets.text("parsed_table", "rag_parsed_docs", "Parsed Docs Table (adap
 
 # COMMAND ----------
 
-# Retrieve widget values
 INPUT_MODE = dbutils.widgets.get("input_mode")
 PDF_DIR = dbutils.widgets.get("pdf_dir")
 IMAGE_DIR = dbutils.widgets.get("image_dir")
@@ -169,19 +136,25 @@ BATCH_SIZE = int(dbutils.widgets.get("batch_size"))
 HF_SECRET_SCOPE = dbutils.widgets.get("hf_secret_scope")
 HF_SECRET_KEY = dbutils.widgets.get("hf_secret_key")
 
+if HF_SECRET_SCOPE and HF_SECRET_KEY:
+    _hf_token = dbutils.secrets.get(scope=HF_SECRET_SCOPE, key=HF_SECRET_KEY)
+    os.environ["HF_TOKEN"] = _hf_token
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = _hf_token
+    print(f"HF token set from secret {HF_SECRET_SCOPE}/{HF_SECRET_KEY}")
+else:
+    print("No HF token configured — gated models may fail to download")
+
 UC_CATALOG = dbutils.widgets.get("uc_catalog")
 UC_SCHEMA = dbutils.widgets.get("uc_schema")
 UC_VOLUME = dbutils.widgets.get("uc_volume")
 UC_TABLE = dbutils.widgets.get("uc_table")
 PARSED_TABLE_SUFFIX = dbutils.widgets.get("parsed_table").strip() or "rag_parsed_docs"
 
-# Construct paths
 UC_VOLUME_PATH = f"/Volumes/{UC_CATALOG}/{UC_SCHEMA}/{UC_VOLUME}"
 UC_TABLE_NAME = f"{UC_CATALOG}.{UC_SCHEMA}.{UC_TABLE}"
 PARSED_TABLE_NAME = f"{UC_CATALOG}.{UC_SCHEMA}.{PARSED_TABLE_SUFFIX}"
 PARQUET_OUTPUT_PATH = f"{UC_VOLUME_PATH}/ocr_inference_output"
 
-# Detect GPUs
 available_gpus = int(ray.cluster_resources().get("GPU", 0))
 NUM_GPUS = available_gpus if available_gpus > 0 else 1
 
@@ -205,8 +178,6 @@ print(f"Parquet Output:   {PARQUET_OUTPUT_PATH}")
 
 # MAGIC %md
 # MAGIC ## Model configuration
-# MAGIC
-# MAGIC Per-model settings for vLLM and sampling. HunyuanOCR uses `AutoProcessor` for the chat template; DeepSeek-OCR uses a raw image prompt with n-gram logits processor.
 
 # COMMAND ----------
 
@@ -220,6 +191,7 @@ MODEL_CONFIGS = {
             gpu_memory_utilization=0.80,
             mm_processor_cache_gb=0,
             enable_prefix_caching=False,
+            enforce_eager=True,  # avoid CUDA graph issues in Ray actor subprocesses
         ),
         "sampling_kwargs": dict(temperature=0, max_tokens=16384),
         "uses_processor": True,
@@ -233,6 +205,7 @@ MODEL_CONFIGS = {
             gpu_memory_utilization=0.80,
             mm_processor_cache_gb=0,
             enable_prefix_caching=False,
+            enforce_eager=True,  # avoid CUDA graph issues in Ray actor subprocesses
         ),
         "sampling_kwargs": dict(
             temperature=0.0,
@@ -249,37 +222,28 @@ MODEL_CONFIGS = {
     },
 }
 cfg = MODEL_CONFIGS[OCR_MODEL]
-print(f"✓ Loaded config for: {OCR_MODEL}")
+print(f"Loaded config for: {OCR_MODEL}")
 print(f"  max_model_len={cfg['llm_kwargs']['max_model_len']}, max_tokens={cfg['sampling_kwargs']['max_tokens']}")
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Pipeline components
-# MAGIC
-# MAGIC <div style="background:#d4edda;border-left:6px solid #28a745;padding:12px;margin:12px 0;border-radius:4px">
-# MAGIC <b>Streaming architecture (PDF mode)</b><br/>
-# MAGIC Ray Data's streaming executor applies <b>backpressure</b> — pages are rendered only as fast as the GPU can consume them. This keeps memory bounded regardless of corpus size.
-# MAGIC </div>
-# MAGIC
-# MAGIC Two components:
-# MAGIC 1. **`render_pages`** — CPU flat-map: PDF bytes → list of `(image_bytes, doc_uri, page_num)` rows
-# MAGIC 2. **`OCRPredictor`** — GPU map-batches: image bytes → OCR text via vLLM
+# MAGIC `render_pages` (CPU) and `OCRPredictor` (GPU). Ray Data applies backpressure to keep memory bounded.
 
 # COMMAND ----------
 
+import os
 import io
 import re
 import glob
-import numpy as np
 from pathlib import Path
 from datetime import datetime
 from PIL import Image
-from vllm import LLM, SamplingParams
 
-# ---------------------------------------------------------------------------
-# 1. Page renderer (PDF mode) — runs on CPU workers
-# ---------------------------------------------------------------------------
+# vLLM imported inside OCRPredictor.__init__ — must set env vars before import (engine decision is cached).
+
+# --- Page renderer (PDF mode, CPU) ---
 def make_render_fn(dpi: int, save_images: bool, image_output_dir: str):
     """Returns a flat_map function that renders PDF pages to PNG bytes."""
     import fitz  # PyMuPDF — imported inside so Ray can serialize the closure
@@ -316,9 +280,7 @@ def make_render_fn(dpi: int, save_images: bool, image_output_dir: str):
     return render_pages
 
 
-# ---------------------------------------------------------------------------
-# 2. Image normalizer (image mode) — reads PNGs, extracts doc_uri + page_num
-# ---------------------------------------------------------------------------
+# --- Image normalizer (image mode) ---
 def normalize_image_row(row):
     """Normalize a PNG file row to the same schema as render_pages output."""
     path = row["path"]
@@ -333,9 +295,7 @@ def normalize_image_row(row):
     return {"image_bytes": image_bytes, "doc_uri": doc_uri, "page_num": page_num}
 
 
-# ---------------------------------------------------------------------------
-# 3. OCR predictor — runs on GPU workers (1 GPU each)
-# ---------------------------------------------------------------------------
+# --- OCR predictor (GPU, 1 GPU per actor) ---
 def make_ocr_predictor(model_name: str, model_configs: dict):
     """Returns an OCRPredictor class configured for the given model."""
     _model_name = model_name
@@ -362,6 +322,15 @@ def make_ocr_predictor(model_name: str, model_configs: dict):
 
     class OCRPredictor:
         def __init__(self):
+            import os, sys, types
+            os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+
+            # Mock broken flash_attn_2_cuda .so — ABI mismatch after vLLM upgrades PyTorch.
+            if "flash_attn_2_cuda" not in sys.modules:
+                sys.modules["flash_attn_2_cuda"] = types.ModuleType("flash_attn_2_cuda")
+
+            from vllm import LLM, SamplingParams
+
             llm_kw = dict(model=_model_name, **_cfg["llm_kwargs"])
             if _cfg["logits_processors"] == "deepseek":
                 from vllm.model_executor.models.deepseek_ocr import NGramPerReqLogitsProcessor
@@ -373,7 +342,7 @@ def make_ocr_predictor(model_name: str, model_configs: dict):
             if _cfg["uses_processor"]:
                 from transformers import AutoProcessor
                 self.processor = AutoProcessor.from_pretrained(_model_name)
-            print(f"✓ OCRPredictor initialized with {_model_name}")
+            print(f"OCRPredictor initialized with {_model_name}")
 
         def _build_input(self, image_bytes: bytes) -> dict:
             img = Image.open(io.BytesIO(image_bytes))
@@ -426,19 +395,16 @@ def make_ocr_predictor(model_name: str, model_configs: dict):
 
 # MAGIC %md
 # MAGIC ## Run the OCR pipeline
-# MAGIC
-# MAGIC Builds the Ray Data pipeline based on `input_mode`, executes it, and writes Parquet.
 
 # COMMAND ----------
 
 def run_pipeline():
-    """Build and execute the OCR pipeline (PDF streaming or image mode)."""
-
-    # --- Build the Ray Dataset ---
     if INPUT_MODE == "pdf":
-        print(f"📄 PDF mode — reading from {PDF_DIR}")
+        print(f"PDF mode — reading from {PDF_DIR}")
         ds = ray.data.read_binary_files(PDF_DIR, include_paths=True)
-        ds = ds.filter(lambda row: row["path"].lower().endswith(".pdf"))
+        def _is_pdf(row):
+            return row["path"].lower().endswith(".pdf")
+        ds = ds.filter(_is_pdf)
         n_pdfs = ds.count()
         print(f"  Found {n_pdfs} PDF(s)")
 
@@ -453,7 +419,7 @@ def run_pipeline():
         )
         ds = ds.flat_map(render_fn)
     else:
-        print(f"🖼️  Image mode — reading PNGs from {IMAGE_DIR}")
+        print(f"Image mode — reading PNGs from {IMAGE_DIR}")
         image_paths = sorted(glob.glob(os.path.join(IMAGE_DIR, "*.png")))
         if not image_paths:
             raise FileNotFoundError(f"No PNG images found in {IMAGE_DIR}")
@@ -463,22 +429,19 @@ def run_pipeline():
         )
         ds = ds.map(normalize_image_row)
 
-    # --- OCR inference (GPU) ---
     OCRPredictor = make_ocr_predictor(OCR_MODEL, MODEL_CONFIGS)
     ds = ds.map_batches(
         OCRPredictor,
-        concurrency=(1, NUM_GPUS),
+        concurrency=NUM_GPUS,
         batch_size=BATCH_SIZE,
         num_gpus=1,
-        num_cpus=12,
+        num_cpus=1,
     )
 
-    # --- Write results ---
     print(f"\nWriting results to {PARQUET_OUTPUT_PATH}")
     ds.write_parquet(PARQUET_OUTPUT_PATH, mode="overwrite")
-    print("✓ Parquet written")
+    print("Parquet written")
 
-    # --- Preview ---
     samples = ray.data.read_parquet(PARQUET_OUTPUT_PATH).take(limit=5)
     print("\n" + "=" * 60)
     print("SAMPLE OCR RESULTS")
@@ -493,7 +456,7 @@ def run_pipeline():
 
 
 parquet_path = run_pipeline()
-print(f"\n✓ OCR inference complete → {parquet_path}")
+print(f"\nOCR inference complete -> {parquet_path}")
 
 # COMMAND ----------
 
@@ -505,7 +468,7 @@ print(f"\n✓ OCR inference complete → {parquet_path}")
 print(f"Loading Parquet from: {PARQUET_OUTPUT_PATH}")
 df_spark = spark.read.parquet(PARQUET_OUTPUT_PATH)
 
-print(f"✓ Loaded {df_spark.count()} rows")
+print(f"Loaded {df_spark.count()} rows")
 df_spark.printSchema()
 
 df_spark.write \
@@ -514,18 +477,14 @@ df_spark.write \
     .option("overwriteSchema", "true") \
     .saveAsTable(UC_TABLE_NAME)
 
-print(f"✓ Delta table created: {UC_TABLE_NAME}")
+print(f"Delta table created: {UC_TABLE_NAME}")
 display(df_spark.limit(10))
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Adapter: OCR table → parsed-docs shape
-# MAGIC
-# MAGIC <div style="background:#f8d7da;border-left:6px solid #dc3545;padding:12px;margin:12px 0;border-radius:4px">
-# MAGIC <b>Why this matters</b><br/>
-# MAGIC The OCR table has <b>one row per page</b>. Downstream chunking (notebook 02) expects <b>one row per document</b> with columns <code>content</code>, <code>parser_status</code>, <code>doc_uri</code>, <code>last_modified</code>. The adapter aggregates pages in order and writes the parsed-docs table.
-# MAGIC </div>
+# MAGIC ## Adapter: OCR table -> parsed-docs shape
+# MAGIC Aggregates per-page OCR rows into one row per document for downstream chunking (notebook 02).
 
 # COMMAND ----------
 
@@ -546,5 +505,5 @@ parsed_df = (
 
 parsed_df.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(PARSED_TABLE_NAME)
 n_docs = spark.table(PARSED_TABLE_NAME).count()
-print(f"✓ Adapter: wrote {n_docs} document(s) to {PARSED_TABLE_NAME}")
+print(f"Adapter: wrote {n_docs} document(s) to {PARSED_TABLE_NAME}")
 display(spark.table(PARSED_TABLE_NAME))

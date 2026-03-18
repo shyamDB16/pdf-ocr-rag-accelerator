@@ -9,24 +9,29 @@ include:
 
 variables:
   catalog:
-    default: main
+    default: shyam_catalog_ss
   schema:
-    default: default
+    default: llm_download
   # Input mode: "pdf" (stream PDFs in memory) or "images" (pre-existing PNGs)
   input_mode:
     default: pdf
   # Where PDFs live (used when input_mode=pdf)
   pdf_dir:
-    default: /Volumes/main/default/ocr_data/pdfs
+    default: /Volumes/shyam_catalog_ss/llm_download/ocr_data/pdf
   # Where PNG images live (used when input_mode=images, or as checkpoint dir when save_images=true)
   image_dir:
-    default: /Volumes/main/default/ocr_data/images
+    default: /Volumes/shyam_catalog_ss/llm_download/ocr_data/images
   # Whether to save rendered PNGs as a checkpoint (pdf mode only)
   save_images:
     default: "false"
+  # HuggingFace secret for gated model downloads
+  hf_secret_scope:
+    default: hf_scope_ss
+  hf_secret_key:
+    default: hf_secret_ss
   # OCR model to use
   ocr_model:
-    default: deepseek-ai/DeepSeek-OCR
+    default: tencent/HunyuanOCR
   # UC Volume name (for parquet output path)
   uc_volume:
     default: ocr_data
@@ -39,31 +44,31 @@ variables:
   vector_search_endpoint:
     default: one-env-shared-endpoint
   embedding_endpoint:
-    default: databricks-bge-m3
+    default: databricks-qwen3-embedding-0-6b
   llm_endpoint:
-    default: databricks-meta-llama-3-3-70b-instruct
+    default: databricks-gpt-oss-20b
   # Number of A10 GPUs for Serverless GPU Compute (SGC job only)
   sgc_num_gpus:
-    default: "5"
+    default: "1"
 
 targets:
   dev:
     default: true
     mode: development
     workspace:
-      profile: DEFAULT
+      profile: new_workspace
       # Or set host explicitly: host: https://your-workspace.cloud.databricks.com
     variables:
-      catalog: main
-      schema: default
+      catalog: shyam_catalog_ss
+      schema: llm_download
       input_mode: pdf
-      pdf_dir: /Volumes/main/default/ocr_data/pdfs
-      image_dir: /Volumes/main/default/ocr_data/images
+      pdf_dir: /Volumes/shyam_catalog_ss/llm_download/ocr_data/pdf
+      image_dir: /Volumes/shyam_catalog_ss/llm_download/ocr_data/images
       save_images: "false"
       parsed_table_suffix: rag_parsed_docs
-      vector_search_endpoint: one-env-shared-endpoint
-      embedding_endpoint: databricks-bge-m3
-      llm_endpoint: databricks-meta-llama-3-3-70b-instruct
+      vector_search_endpoint: one-env-shared-endpoint-11
+      embedding_endpoint: databricks-qwen3-embedding-0-6b
+      llm_endpoint: databricks-gpt-oss-20b
 
   prod:
     mode: production

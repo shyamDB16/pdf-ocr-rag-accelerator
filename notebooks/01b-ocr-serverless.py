@@ -2,43 +2,30 @@
 # MAGIC %md
 # MAGIC # 1b. OCR Pipeline — PDF / Image → Parsed Docs (Serverless GPU)
 # MAGIC
-# MAGIC <div style="background:#e7f3fe;border-left:6px solid #2196F3;padding:12px;margin:12px 0;border-radius:4px">
-# MAGIC <b>Serverless GPU variant</b><br/>
-# MAGIC Same pipeline as <code>01-ocr-and-adapter.py</code> but uses <b>Databricks Serverless GPU Compute (SGC)</b> instead of a classic GPU cluster. SGC auto-provisions remote A10 GPUs — no cluster configuration needed.
-# MAGIC </div>
+# MAGIC Same pipeline as `01-ocr-and-adapter.py` but runs on **Databricks Serverless GPU Compute (SGC)** — no cluster config needed.
 # MAGIC
-# MAGIC **Differences from classic (01):**
-# MAGIC - Uses `@ray_launch` from `serverless_gpu.ray` to provision remote GPUs
-# MAGIC - Calls `.distributed()` to execute on provisioned workers
-# MAGIC - `num_gpus` is set explicitly (not auto-detected from cluster)
-# MAGIC - No `ray.init()` — handled by `@ray_launch`
+# MAGIC **Differences from classic (01):** uses `@ray_launch` + `.distributed()` instead of `ray.init()`, and `num_gpus` is set explicitly.
 # MAGIC
-# MAGIC **Setup:**
-# MAGIC 1. Click **Connect** → **Serverless GPU**
-# MAGIC 2. Open **Environment** side panel → set **Accelerator** to **A10**
-# MAGIC 3. Click **Apply** and **Confirm**
+# MAGIC **Setup:** Connect → Serverless GPU → Environment panel → Accelerator: A10 → Apply.
 # MAGIC
-# MAGIC **Output:** Same `rag_parsed_docs` table as notebook 01 — notebooks 02 and 03 work unchanged.
+# MAGIC **Output:** Same `rag_parsed_docs` table — notebooks 02 and 03 work unchanged.
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Install dependencies
+# MAGIC Install dependencies
 
 # COMMAND ----------
 
-# Pre-compiled Flash Attention for A10s
-%pip install --no-cache-dir "torch==2.9.0+cu128" --index-url https://download.pytorch.org/whl/cu128
-%pip install -U --no-cache-dir wheel ninja packaging
-%pip install --force-reinstall --no-cache-dir --no-build-isolation flash-attn
-%pip install einops hf_transfer
-%pip install "ray[data]>=2.47.1"
+# SGC pre-installs: torch, ray, transformers, Pillow, packaging, flash-attn
+# Only install what's NOT in the environment:
+%pip install "vllm==0.13.0" "pymupdf>=1.23.0" einops hf_transfer --quiet
 
-# vLLM with all dependencies
-%pip install "vllm==0.13.0"
-
-# PDF and image processing
-%pip install pdf2image Pillow "pymupdf>=1.23.0"
+# vLLM pulls mistral_common which imports cv2 (OpenCV). On Databricks runtimes,
+# cv2's native bootstrap triggers an OpenSSL FIPS self-test that crashes (SIGABRT).
+# We don't need OpenCV — PIL + pymupdf handle all image work. Remove it entirely
+# so mistral_common's `is_opencv_installed()` returns False gracefully.
+%pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python 2>/dev/null; true
 
 %restart_python
 
@@ -46,33 +33,30 @@
 # COMMAND ----------
 
 from packaging.version import Version
-import torch
-import flash_attn
-import vllm
+import importlib.metadata
 import ray
-import transformers
-from PIL import Image
 
-print(f"PyTorch: {torch.__version__}")
-print(f"Flash Attention: {flash_attn.__version__}")
-print(f"vLLM: {vllm.__version__}")
+# Check versions via metadata (GPU libs load on remote workers, not orchestrator).
+def _version(pkg):
+    try:
+        return importlib.metadata.version(pkg)
+    except importlib.metadata.PackageNotFoundError:
+        return "NOT INSTALLED"
+
+print(f"PyTorch: {_version('torch')}")
+print(f"Flash Attention: {_version('flash-attn')}")
+print(f"vLLM: {_version('vllm')}")
 print(f"Ray: {ray.__version__}")
-print(f"Transformers: {transformers.__version__}")
+print(f"Transformers: {_version('transformers')}")
 
 assert Version(ray.__version__) >= Version("2.47.1"), "Ray version must be at least 2.47.1"
-print("\n✓ All version checks passed!")
+print("\nAll version checks passed")
 
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Configuration
-# MAGIC
-# MAGIC <div style="background:#fff3cd;border-left:6px solid #ffc107;padding:12px;margin:12px 0;border-radius:4px">
-# MAGIC <b>SGC note</b><br/>
-# MAGIC <code>num_gpus</code> sets how many remote A10 GPUs <code>@ray_launch</code> provisions.
-# MAGIC The notebook itself runs on a single A10 for orchestration; the heavy OCR work runs on the provisioned workers.
-# MAGIC </div>
+# MAGIC Configuration — `num_gpus` controls how many remote A10s `@ray_launch` provisions.
 
 # COMMAND ----------
 
@@ -115,6 +99,14 @@ NUM_GPUS = int(dbutils.widgets.get("num_gpus"))
 HF_SECRET_SCOPE = dbutils.widgets.get("hf_secret_scope")
 HF_SECRET_KEY = dbutils.widgets.get("hf_secret_key")
 
+if HF_SECRET_SCOPE and HF_SECRET_KEY:
+    _hf_token = dbutils.secrets.get(scope=HF_SECRET_SCOPE, key=HF_SECRET_KEY)
+    os.environ["HF_TOKEN"] = _hf_token
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = _hf_token
+    print(f"HF token set from secret {HF_SECRET_SCOPE}/{HF_SECRET_KEY}")
+else:
+    print("No HF token configured — gated models may fail to download")
+
 UC_CATALOG = dbutils.widgets.get("uc_catalog")
 UC_SCHEMA = dbutils.widgets.get("uc_schema")
 UC_VOLUME = dbutils.widgets.get("uc_volume")
@@ -145,7 +137,7 @@ print(f"Parquet Output:   {PARQUET_OUTPUT_PATH}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Model configuration
+# MAGIC Model configuration
 
 # COMMAND ----------
 
@@ -159,6 +151,7 @@ MODEL_CONFIGS = {
             gpu_memory_utilization=0.90,
             mm_processor_cache_gb=0,
             enable_prefix_caching=False,
+            enforce_eager=True,
         ),
         "sampling_kwargs": dict(temperature=0, max_tokens=16384),
         "uses_processor": True,
@@ -172,6 +165,7 @@ MODEL_CONFIGS = {
             gpu_memory_utilization=0.90,
             mm_processor_cache_gb=0,
             enable_prefix_caching=False,
+            enforce_eager=True,
         ),
         "sampling_kwargs": dict(
             temperature=0.0,
@@ -188,20 +182,13 @@ MODEL_CONFIGS = {
     },
 }
 cfg = MODEL_CONFIGS[OCR_MODEL]
-print(f"✓ Loaded config for: {OCR_MODEL}")
+print(f"Loaded config for: {OCR_MODEL}")
 print(f"  max_model_len={cfg['llm_kwargs']['max_model_len']}, max_tokens={cfg['sampling_kwargs']['max_tokens']}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Define the distributed OCR pipeline (SGC)
-# MAGIC
-# MAGIC <div style="background:#d4edda;border-left:6px solid #28a745;padding:12px;margin:12px 0;border-radius:4px">
-# MAGIC <b>How SGC works</b><br/>
-# MAGIC <code>@ray_launch(gpus=N, gpu_type='a10', remote=True)</code> provisions <b>N remote A10 GPUs</b>.
-# MAGIC The decorated function runs on the Ray cluster with those GPUs available.
-# MAGIC Call <code>.distributed()</code> to launch — initial startup may take a few minutes as GPU nodes are provisioned and models are loaded.
-# MAGIC </div>
+# MAGIC Define the distributed OCR pipeline (SGC)
 
 # COMMAND ----------
 
@@ -209,16 +196,30 @@ from serverless_gpu.ray import ray_launch
 import io
 import re
 import glob
-import numpy as np
 from pathlib import Path
 from datetime import datetime
-from PIL import Image
-from vllm import LLM, SamplingParams
+
+# vLLM and PIL are imported inside @ray_launch so they load on remote GPU workers.
 
 
 @ray_launch(gpus=NUM_GPUS, gpu_type='a10', remote=True)
 def run_ocr_pipeline():
-    """Distributed OCR pipeline on Serverless GPU — streaming PDF or image input."""
+    # Disable v1 multiprocessing (incompatible with Ray actors)
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+
+    # Mock flash_attn CUDA ext — vLLM only needs the pure-Triton rotary ops
+    import sys, types
+    if "flash_attn_2_cuda" not in sys.modules:
+        sys.modules["flash_attn_2_cuda"] = types.ModuleType("flash_attn_2_cuda")
+
+    from PIL import Image
+    from vllm import LLM, SamplingParams
+
+    # Propagate HF token to remote workers for gated model downloads
+    hf_token = os.environ.get("HF_TOKEN", "")
+    if hf_token:
+        os.environ["HF_TOKEN"] = hf_token
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token
 
     _model_name = OCR_MODEL
     _cfg = MODEL_CONFIGS[_model_name]
@@ -294,6 +295,14 @@ def run_ocr_pipeline():
     # --- OCR predictor ---
     class OCRPredictor:
         def __init__(self):
+            import os, sys, types
+            os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+
+            # Mock flash_attn CUDA ext (ABI mismatch); vLLM only needs pure-Triton rotary
+            if "flash_attn_2_cuda" not in sys.modules:
+                sys.modules["flash_attn_2_cuda"] = types.ModuleType("flash_attn_2_cuda")
+
+            from vllm import LLM, SamplingParams
             llm_kw = dict(model=_model_name, **_cfg["llm_kwargs"])
             if _cfg["logits_processors"] == "deepseek":
                 from vllm.model_executor.models.deepseek_ocr import NGramPerReqLogitsProcessor
@@ -305,7 +314,7 @@ def run_ocr_pipeline():
             if _cfg["uses_processor"]:
                 from transformers import AutoProcessor
                 self.processor = AutoProcessor.from_pretrained(_model_name)
-            print(f"✓ OCRPredictor initialized with {_model_name}")
+            print(f"OCRPredictor initialized with {_model_name}")
 
         def _build_input(self, image_bytes):
             img = Image.open(io.BytesIO(image_bytes))
@@ -354,9 +363,11 @@ def run_ocr_pipeline():
 
     # ---- Build the Ray Dataset ----
     if INPUT_MODE == "pdf":
-        print(f"📄 PDF mode — reading from {PDF_DIR}")
+        print(f"PDF mode — reading from {PDF_DIR}")
         ds = ray.data.read_binary_files(PDF_DIR, include_paths=True)
-        ds = ds.filter(lambda row: row["path"].lower().endswith(".pdf"))
+        def _is_pdf(row):
+            return row["path"].lower().endswith(".pdf")
+        ds = ds.filter(_is_pdf)
         n_pdfs = ds.count()
         print(f"  Found {n_pdfs} PDF(s)")
 
@@ -371,7 +382,7 @@ def run_ocr_pipeline():
         )
         ds = ds.flat_map(render_fn)
     else:
-        print(f"🖼️  Image mode — reading PNGs from {IMAGE_DIR}")
+        print(f"Image mode — reading PNGs from {IMAGE_DIR}")
         image_paths = sorted(glob.glob(os.path.join(IMAGE_DIR, "*.png")))
         if not image_paths:
             raise FileNotFoundError(f"No PNG images found in {IMAGE_DIR}")
@@ -384,16 +395,16 @@ def run_ocr_pipeline():
     # ---- OCR inference (GPU) ----
     ds = ds.map_batches(
         OCRPredictor,
-        concurrency=(1, NUM_GPUS),
+        concurrency=NUM_GPUS,
         batch_size=BATCH_SIZE,
         num_gpus=1,
-        num_cpus=12,
+        num_cpus=1,
     )
 
     # ---- Write results ----
     print(f"\nWriting results to {PARQUET_OUTPUT_PATH}")
     ds.write_parquet(PARQUET_OUTPUT_PATH, mode="overwrite")
-    print("✓ Parquet written")
+    print("Parquet written")
 
     # ---- Preview ----
     samples = ray.data.read_parquet(PARQUET_OUTPUT_PATH).take(limit=5)
@@ -411,29 +422,24 @@ def run_ocr_pipeline():
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Run distributed OCR on Serverless GPU
-# MAGIC
-# MAGIC <div style="background:#fff3cd;border-left:6px solid #ffc107;padding:12px;margin:12px 0;border-radius:4px">
-# MAGIC <b>Startup time</b><br/>
-# MAGIC Initial launch may take a few minutes as remote A10 GPU nodes are provisioned and models are loaded. Subsequent runs on a warm cluster are faster.
-# MAGIC </div>
+# MAGIC Run distributed OCR on Serverless GPU (first launch may take a few minutes while GPUs provision)
 
 # COMMAND ----------
 
 parquet_path = run_ocr_pipeline.distributed()
-print(f"\n✓ OCR inference complete → {parquet_path}")
+print(f"\nOCR inference complete -> {parquet_path}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Save as Delta table in Unity Catalog
+# MAGIC Save as Delta table in Unity Catalog
 
 # COMMAND ----------
 
 print(f"Loading Parquet from: {PARQUET_OUTPUT_PATH}")
 df_spark = spark.read.parquet(PARQUET_OUTPUT_PATH)
 
-print(f"✓ Loaded {df_spark.count()} rows")
+print(f"Loaded {df_spark.count()} rows")
 df_spark.printSchema()
 
 df_spark.write \
@@ -442,15 +448,13 @@ df_spark.write \
     .option("overwriteSchema", "true") \
     .saveAsTable(UC_TABLE_NAME)
 
-print(f"✓ Delta table created: {UC_TABLE_NAME}")
+print(f"Delta table created: {UC_TABLE_NAME}")
 display(df_spark.limit(10))
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Adapter: OCR table → parsed-docs shape
-# MAGIC
-# MAGIC Aggregates page-level OCR rows into one row per document — same output as notebook 01 (classic). Notebooks 02 and 03 work unchanged.
+# MAGIC Adapter: aggregate page-level OCR rows into one row per document (same shape as notebook 01)
 
 # COMMAND ----------
 
@@ -471,5 +475,5 @@ parsed_df = (
 
 parsed_df.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(PARSED_TABLE_NAME)
 n_docs = spark.table(PARSED_TABLE_NAME).count()
-print(f"✓ Adapter: wrote {n_docs} document(s) to {PARSED_TABLE_NAME}")
+print(f"Adapter: wrote {n_docs} document(s) to {PARSED_TABLE_NAME}")
 display(spark.table(PARSED_TABLE_NAME))
